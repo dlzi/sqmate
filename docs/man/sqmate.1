@@ -1,0 +1,337 @@
+.\" Man page for SQMATE
+.\" Generated for SQMATE 1.0.0
+.TH SQMATE 1 "July 13, 2025" "SQMATE 1.0.0" "User Commands"
+.SH NAME
+sqmate \- Universal SQL Server Manager for MySQL and MariaDB portable installations
+.SH SYNOPSIS
+.B sqmate
+.I COMMAND
+[
+.I OPTIONS
+]
+[
+.I HOSTNAME:PORT
+]
+.SH DESCRIPTION
+.B SQMATE
+is a lightweight command-line utility that simplifies management of portable MySQL and MariaDB installations for local development. It automatically detects your database engine and streamlines server startup, configuration, and monitoring with sensible defaults and multiple profile support.
+.PP
+SQMATE requires Bash 4.0 or higher and a portable MySQL or MariaDB installation. Logging verbosity can be controlled by setting the
+.B LOG_LEVEL
+environment variable to one of DEBUG, INFO, WARNING, or ERROR (default: INFO). The
+.B \-\-debug
+option is a convenience that sets
+.B LOG_LEVEL=DEBUG
+for a single command.
+.SH COMMANDS
+.TP
+.B init
+.B sqmate init
+[
+.I OPTIONS
+]
+.br
+Initialize database data directory and set installation path. Prompts for the MySQL/MariaDB installation directory and automatically detects the engine type.
+.RS
+.TP
+.B \-\-sql-dir=PATH
+Set MySQL/MariaDB installation directory.
+.TP
+.B \-\-profile=NAME
+Use specific configuration profile (default: default).
+.TP
+.B \-\-debug
+Enable debug logging (sets LOG_LEVEL=DEBUG).
+.RE
+.TP
+.B start
+.B sqmate start
+[
+.I OPTIONS
+]
+[
+.I HOSTNAME:PORT
+]
+.br
+Start the database server (default: localhost:3306).
+.RS
+.TP
+.B \-\-host=HOSTNAME
+Set database hostname (default: localhost).
+.TP
+.B \-\-port=NUMBER
+Set database port (default: 3306).
+.TP
+.B \-\-profile=NAME
+Use specific configuration profile (default: default).
+.TP
+.B \-\-debug
+Enable debug logging (sets LOG_LEVEL=DEBUG).
+.RE
+.TP
+.B stop
+.B sqmate stop
+[
+.I OPTIONS
+]
+.br
+Stop the running database server.
+.RS
+.TP
+.B \-\-profile=NAME
+Use specific configuration profile (default: default).
+.TP
+.B \-\-debug
+Enable debug logging (sets LOG_LEVEL=DEBUG).
+.RE
+.TP
+.B restart
+.B sqmate restart
+[
+.I OPTIONS
+]
+[
+.I HOSTNAME:PORT
+]
+.br
+Restart the database server.
+.RS
+Options: Same as for the
+.B start
+command.
+.RE
+.TP
+.B status
+.B sqmate status
+[
+.I OPTIONS
+]
+.br
+Show server status including uptime and process information.
+.RS
+.TP
+.B \-\-profile=NAME
+Use specific configuration profile (default: default).
+.TP
+.B \-\-debug
+Enable debug logging (sets LOG_LEVEL=DEBUG).
+.RE
+.TP
+.B connect
+.B sqmate connect
+[
+.I OPTIONS
+]
+.br
+Connect to the database server using the MySQL client.
+.RS
+.TP
+.B \-\-profile=NAME
+Use specific configuration profile (default: default).
+.TP
+.B \-\-debug
+Enable debug logging (sets LOG_LEVEL=DEBUG).
+.RE
+.TP
+.B logs
+.B sqmate logs
+[
+.I OPTIONS
+]
+.br
+Show recent database error logs.
+.RS
+.TP
+.B \-\-profile=NAME
+Use specific configuration profile (default: default).
+.TP
+.B \-\-debug
+Enable debug logging (sets LOG_LEVEL=DEBUG).
+.RE
+.TP
+.B config
+.B sqmate config
+[
+.I OPTIONS
+]
+.br
+Show current configuration.
+.RS
+.TP
+.B \-\-profile=NAME
+Use specific configuration profile (default: default).
+.TP
+.B \-\-debug
+Enable debug logging (sets LOG_LEVEL=DEBUG).
+.RE
+.TP
+.B help
+.B sqmate help
+.br
+Display the help information.
+.TP
+.B version
+.B sqmate version
+.br
+Show version information.
+.SH EXAMPLES
+Initialize a new database installation:
+.EX
+sqmate init
+.EE
+Start a server on the default port:
+.EX
+sqmate start
+.EE
+Start a server on a specific port:
+.EX
+sqmate start localhost:3307
+.EE
+Start a server on all interfaces with custom port:
+.EX
+sqmate start \-\-host=0.0.0.0 \-\-port=3307
+.EE
+Use a named configuration profile for MySQL:
+.EX
+sqmate init \-\-profile=mysql8 \-\-sql-dir=/opt/mysql-8.0.39
+sqmate start \-\-profile=mysql8
+.EE
+Use a named configuration profile for MariaDB:
+.EX
+sqmate init \-\-profile=mariadb11 \-\-sql-dir=/opt/mariadb-10.11.5
+sqmate start \-\-profile=mariadb11 \-\-port=3307
+.EE
+Check server status:
+.EX
+sqmate status
+.EE
+Connect to the database:
+.EX
+sqmate connect
+.EE
+View recent error logs:
+.EX
+sqmate logs
+.EE
+Stop the server:
+.EX
+sqmate stop
+.EE
+Show current configuration:
+.EX
+sqmate config
+.EE
+Show version information:
+.EX
+sqmate version
+.EE
+.SH SUPPORTED DATABASES
+.TP
+.B MySQL
+Versions 5.7, 8.0, 8.1 and higher. Uses
+.B mysqld \-\-initialize
+for data directory initialization and generates a temporary root password.
+.TP
+.B MariaDB
+Versions 10.3, 10.4, 10.5, 10.6, 10.11, 11.x and higher. Uses
+.B mysql_install_db
+or
+.B mysqld \-\-initialize-insecure
+for initialization with no default root password.
+.SH FILES
+.TP
+.I ~/.config/sqmate/config_PROFILE
+Configuration file for each profile. PROFILE is the profile name (default: default).
+.TP
+.I ~/.config/sqmate/sqmate_PROFILE.pid
+PID file for the running server for each profile.
+.TP
+.I ~/.config/sqmate/sqmate_PROFILE.log
+Log file for SQMATE operations for each profile.
+.TP
+.I /tmp/sqmate_PROFILE_PORT.sock
+Unix domain socket file for secure local connections.
+.TP
+.I SQL_DIR/data/
+Database data directory containing system tables and user data.
+.TP
+.I SQL_DIR/logs/mysqld_error.log
+Database server error log.
+.TP
+.I SQL_DIR/logs/mysqld_general.log
+Database server general query log.
+.SH EXIT STATUS
+.TP
+0
+Success
+.TP
+1
+Failure
+.TP
+2
+Invalid command-line option
+.SH ENVIRONMENT VARIABLES
+.TP
+.B SQMATE_CONFIG_DIR
+Override default configuration directory (~/.config/sqmate).
+.TP
+.B LOG_LEVEL
+Set logging verbosity (DEBUG, INFO, WARNING, ERROR; default: INFO).
+.SH SECURITY CONSIDERATIONS
+.IP \(bu 2
+By default, servers bind to localhost only for security.
+.IP \(bu 2
+Local connections use secure Unix domain sockets.
+.IP \(bu 2
+Use
+.B \-\-host=0.0.0.0
+only when external access is needed.
+.IP \(bu 2
+Change default passwords immediately after setup.
+.IP \(bu 2
+Configuration files are protected with 600 permissions.
+.SH TROUBLESHOOTING
+.TP
+.B "SQL directory not configured"
+Run
+.B sqmate init
+first to set up the installation.
+.TP
+.B "Data directory not initialized"
+Run
+.B sqmate init
+to create the necessary system tables.
+.TP
+.B "Port in use"
+Another server is running on the port. Use a different port or stop the existing server.
+.TP
+.B "Process not found"
+Stale PID file detected. Run
+.B sqmate stop
+to clean up.
+.TP
+.B "Connection refused"
+Check if the server is running with
+.B sqmate status
+.PP
+For detailed troubleshooting, enable debug logging with
+.B \-\-debug
+and check the error logs with
+.B sqmate logs
+.SH AUTHOR
+Based on the design patterns of PHMATE by Daniel Zilli
+.SH SEE ALSO
+.BR mysql (1),
+.BR mysqld (8),
+.BR mariadb (1),
+.BR mariadbd (8),
+.BR lsof (8),
+.BR ss (8)
+.PP
+The
+.B ss
+command is preferred for port checking, with
+.B lsof
+used as a fallback.
+.SH LICENSE
+MIT License
