@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# SQLMATE - Universal SQL Server Manager
+# SQMATE - Universal SQL Server Manager
 # A lightweight tool to manage MySQL and MariaDB portable installations for local development.
 #
 # Based on the design patterns of PHMATE by Daniel Zilli
@@ -17,11 +17,11 @@ SQL_DIR=""
 SQL_ENGINE=""  # mysql or mariadb (auto-detected)
 VERSION="1.0.0"
 PROFILE="default"
-CONFIG_DIR="${SQLMATE_CONFIG_DIR:-${HOME}/.config/sqlmate}"
+CONFIG_DIR="${SQMATE_CONFIG_DIR:-${HOME}/.config/sqmate}"
 CONFIG_FILE="${CONFIG_DIR}/config_${PROFILE}"
-PIDFILE="${CONFIG_DIR}/sqlmate.pid"
-LOGFILE="${CONFIG_DIR}/sqlmate.log"
-SOCKET_FILE="/tmp/sqlmate_${PROFILE}.sock"
+PIDFILE="${CONFIG_DIR}/sqmate.pid"
+LOGFILE="${CONFIG_DIR}/sqmate.log"
+SOCKET_FILE="/tmp/sqmate_${PROFILE}.sock"
 SQL_BIN=""
 
 declare -A LOG_LEVELS=([DEBUG]=0 [INFO]=1 [WARNING]=2 [ERROR]=3)
@@ -196,22 +196,23 @@ EOF
 usage() {
     cat << EOF
 
-SQLMATE - Universal SQL Server Manager
+SQMATE - Universal SQL Server Manager
 
 Usage:
-    sqlmate <command> [options] [<hostname>:<port>]
+    sqmate <command> [options] [<hostname>:<port>]
 
 Commands:
-    init      Initialize SQL data directory and set installation path
-    start     Start the SQL server (default: localhost:3306)
-    stop      Stop the running server
-    restart   Restart the server
-    status    Show server status
-    config    Show current configuration
-    connect   Connect to SQL server
-    logs      Show recent error logs
-    help      Display this help information
-    version   Show version information
+    init        Initialize SQL data directory and set installation path
+    start       Start the SQL server (default: localhost:3306)
+    stop        Stop the running server
+    restart     Restart the server
+    status      Show server status
+    config      Show current configuration
+    connect     Connect to SQL server
+    logs        Show recent error logs
+    reset-auth  Reset MariaDB/MySQL root authentication (fixes login issues)
+    help        Display this help information
+    version     Show version information
 
 Options:
     --sql-dir=<path>     Set MySQL/MariaDB installation directory
@@ -221,14 +222,14 @@ Options:
     --debug              Enable debug logging (sets LOG_LEVEL=DEBUG)
 
 Examples:
-    sqlmate init
-    sqlmate start
-    sqlmate start --host=0.0.0.0 --port=3307
-    sqlmate start --profile=mysql8
-    sqlmate start --profile=mariadb11
-    sqlmate config --profile=production
-    sqlmate connect
-    sqlmate stop
+    sqmate init
+    sqmate start
+    sqmate start --host=0.0.0.0 --port=3307
+    sqmate start --profile=mysql8
+    sqmate start --profile=mariadb11
+    sqmate config --profile=production
+    sqmate connect
+    sqmate stop
 
 Profile Creation:
     Profiles are created automatically when you use --profile=<name> for the first time.
@@ -236,17 +237,17 @@ Profile Creation:
     on different ports.
 
     Example workflow:
-    sqlmate init --profile=mysql8 --sql-dir=/opt/mysql-8.0.39
-    sqlmate start --profile=mysql8 --port=3306
-    sqlmate init --profile=mariadb11 --sql-dir=/opt/mariadb-10.11.5
-    sqlmate start --profile=mariadb11 --port=3307
+    sqmate init --profile=mysql8 --sql-dir=/opt/mysql-8.0.39
+    sqmate start --profile=mysql8 --port=3306
+    sqmate init --profile=mariadb11 --sql-dir=/opt/mariadb-10.11.5
+    sqmate start --profile=mariadb11 --port=3307
 
 Supported Databases:
     - MySQL 5.7, 8.0, 8.1+ (auto-detected)
     - MariaDB 10.3, 10.4, 10.5, 10.6, 10.11, 11.x+ (auto-detected)
 
 Environment Variables:
-    SQLMATE_CONFIG_DIR   Override default config directory (~/.config/sqlmate)
+    SQMATE_CONFIG_DIR   Override default config directory (~/.config/sqmate)
     LOG_LEVEL            Set logging verbosity (DEBUG, INFO, WARNING, ERROR)
 
 EOF
@@ -254,7 +255,7 @@ EOF
 
 # Function: display version information.
 show_version() {
-    echo "SQLMATE - Universal SQL Server Manager"
+    echo "SQMATE - Universal SQL Server Manager"
     echo "Version: ${VERSION}"
     echo "Supports: MySQL and MariaDB portable installations"
     echo "Based on PHMATE design patterns by Daniel Zilli"
@@ -320,34 +321,43 @@ detect_sql_engine() {
     # Input parameter
     local sql_dir="${SQL_DIR}"
     local mysqld_path="${sql_dir}/bin/mysqld"
+    local mariadbd_path="${sql_dir}/bin/mariadbd"
     
     log_message "DEBUG" "Detecting SQL engine type in: $sql_dir"
 
-    # Check if mysqld exists
-    if [ ! -f "$mysqld_path" ]; then
-        log_message "ERROR" "mysqld binary not found at: $mysqld_path"
-        return 1
-    fi
-
-    # Try to get version information
-    local version_output
-    version_output=$("$mysqld_path" --version 2>/dev/null) || {
-        log_message "ERROR" "Failed to get version from mysqld binary"
-        return 1
-    }
-
-    log_message "DEBUG" "Version output: $version_output"
-
-    # Detect based on version string
-    if echo "$version_output" | grep -qi "mariadb"; then
+    # Check for MariaDB first (prefer mariadbd over mysqld)
+    if [ -f "$mariadbd_path" ]; then
         SQL_ENGINE="mariadb"
-        log_message "DEBUG" "Detected MariaDB engine"
-    elif echo "$version_output" | grep -qi "mysql"; then
-        SQL_ENGINE="mysql"
-        log_message "DEBUG" "Detected MySQL engine"
+        SQL_BIN="$mariadbd_path"
+        log_message "DEBUG" "Found mariadbd binary, detected MariaDB engine"
+        return 0
+    elif [ -f "$mysqld_path" ]; then
+        # Try to get version information to distinguish between MySQL and MariaDB
+        local version_output
+        version_output=$("$mysqld_path" --version 2>/dev/null) || {
+            log_message "ERROR" "Failed to get version from mysqld binary"
+            return 1
+        }
+
+        log_message "DEBUG" "Version output: $version_output"
+
+        # Detect based on version string
+        if echo "$version_output" | grep -qi "mariadb"; then
+            SQL_ENGINE="mariadb"
+            SQL_BIN="$mysqld_path"
+            log_message "DEBUG" "Detected MariaDB engine (using mysqld binary)"
+        elif echo "$version_output" | grep -qi "mysql"; then
+            SQL_ENGINE="mysql"
+            SQL_BIN="$mysqld_path"
+            log_message "DEBUG" "Detected MySQL engine"
+        else
+            log_message "WARNING" "Unable to detect SQL engine type, assuming MySQL"
+            SQL_ENGINE="mysql"
+            SQL_BIN="$mysqld_path"
+        fi
     else
-        log_message "WARNING" "Unable to detect SQL engine type, assuming MySQL"
-        SQL_ENGINE="mysql"
+        log_message "ERROR" "Neither mysqld nor mariadbd binary found in: $sql_dir/bin/"
+        return 1
     fi
 
     return 0
@@ -361,7 +371,7 @@ validate_sql() {
 
     # Check if SQL directory is set
     if [ -z "$sql_dir" ]; then
-        log_message "ERROR" "SQL directory not configured. Run 'sqlmate init' first."
+        log_message "ERROR" "SQL directory not configured. Run 'sqmate init' first."
         return 1
     fi
 
@@ -370,21 +380,12 @@ validate_sql() {
         return 1
     fi
 
-    # Check for mysqld binary
-    local mysqld_path="${sql_dir}/bin/mysqld"
-    if ! validate_path "$mysqld_path" "file" "SQL server binary"; then
-        return 1
-    fi
-
     # Detect engine type
     detect_sql_engine || return 1
 
-    # Update SQL_BIN
-    SQL_BIN="$mysqld_path"
-
-    # Check if mysqld is executable
-    if [ ! -x "$mysqld_path" ]; then
-        log_message "ERROR" "SQL server binary is not executable: $mysqld_path"
+    # Check if binary is executable
+    if [ ! -x "$SQL_BIN" ]; then
+        log_message "ERROR" "SQL server binary is not executable: $SQL_BIN"
         return 1
     fi
 
@@ -457,7 +458,7 @@ parse_hostport() {
     fi
 
     # Update socket file with new profile/port
-    SOCKET_FILE="/tmp/sqlmate_${PROFILE}_${SQL_PORT}.sock"
+    SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
 
     # Log result
     log_message "DEBUG" "Parsed host:port as HOST=$SQL_HOST, PORT=$SQL_PORT"
@@ -481,9 +482,9 @@ parse_options() {
             --profile=*)
                 PROFILE="${arg#*=}"
                 CONFIG_FILE="${CONFIG_DIR}/config_${PROFILE}"
-                PIDFILE="${CONFIG_DIR}/sqlmate_${PROFILE}.pid"
-                LOGFILE="${CONFIG_DIR}/sqlmate_${PROFILE}.log"
-                SOCKET_FILE="/tmp/sqlmate_${PROFILE}_${SQL_PORT}.sock"
+                PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.pid"
+                LOGFILE="${CONFIG_DIR}/sqmate_${PROFILE}.log"
+                SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
                 shift
                 ;;
             --host=*)
@@ -494,7 +495,7 @@ parse_options() {
             --port=*)
                 SQL_PORT="${arg#*=}"
                 validate_port "$SQL_PORT" || return 1
-                SOCKET_FILE="/tmp/sqlmate_${PROFILE}_${SQL_PORT}.sock"
+                SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
                 shift
                 ;;
             --debug)
@@ -561,9 +562,9 @@ load_config() {
     CONFIG_FILE="$config_file"
 
     # Update dependent variables
-    PIDFILE="${CONFIG_DIR}/sqlmate_${PROFILE}.pid"
-    LOGFILE="${CONFIG_DIR}/sqlmate_${PROFILE}.log"
-    SOCKET_FILE="/tmp/sqlmate_${PROFILE}_${SQL_PORT}.sock"
+    PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.pid"
+    LOGFILE="${CONFIG_DIR}/sqmate_${PROFILE}.log"
+    SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
 
     # Configuration loaded successfully
     return 0
@@ -586,7 +587,7 @@ save_config() {
 
     # Write configuration to file
     if ! cat > "$CONFIG_FILE" << EOF; then
-# SQLMATE Configuration for profile: $PROFILE
+# SQMATE Configuration for profile: $PROFILE
 SQL_HOST="$SQL_HOST"
 SQL_PORT="$SQL_PORT"
 SQL_DIR="$abs_sql_dir"
@@ -658,7 +659,7 @@ prompt_sql_directory() {
     fi
     
     echo "Please enter the path to your MySQL/MariaDB installation directory:"
-    echo "(This should contain the 'bin' subdirectory with mysqld)"
+    echo "(This should contain the 'bin' subdirectory with mysqld or mariadbd)"
     echo
     read -r sql_dir_input
     
@@ -680,10 +681,11 @@ prompt_sql_directory() {
         return 1
     fi
     
-    # Check for mysqld binary
-    if ! validate_path "${sql_dir_input}/bin/mysqld" "file" "SQL server binary"; then
+    # Check for MariaDB binary first
+    if ! validate_path "${sql_dir_input}/bin/mariadbd" "file" "MariaDB server binary" 2>/dev/null && \
+       ! validate_path "${sql_dir_input}/bin/mysqld" "file" "SQL server binary"; then
         log_message "ERROR" "Directory '$sql_dir_input' does not appear to be a valid MySQL/MariaDB installation"
-        log_message "ERROR" "Expected to find: ${sql_dir_input}/bin/mysqld"
+        log_message "ERROR" "Expected to find either: ${sql_dir_input}/bin/mariadbd or ${sql_dir_input}/bin/mysqld"
         return 1
     fi
     
@@ -801,13 +803,13 @@ start_server() {
 
     # Validate data directory
     validate_path "$data_dir" "dir" "SQL data directory" || {
-        log_message "ERROR" "SQL data directory not found. Run 'sqlmate init' first."
+        log_message "ERROR" "SQL data directory not found. Run 'sqmate init' first."
         return 1
     }
 
     # Check if data directory is initialized
     if [ ! -d "$data_dir/mysql" ]; then
-        log_message "ERROR" "SQL data directory not initialized. Run 'sqlmate init' first."
+        log_message "ERROR" "SQL data directory not initialized. Run 'sqmate init' first."
         return 1
     fi
 
@@ -819,12 +821,20 @@ start_server() {
 
     # Check for existing server
     if manage_pidfile check; then
-        log_message "WARNING" "${SQL_ENGINE^} server is already running. Use 'sqlmate restart' or stop it first."
+        log_message "WARNING" "${SQL_ENGINE^} server is already running. Use 'sqmate restart' or stop it first."
         return 1
     fi
 
-    # Build server command
-    local start_command="\"$SQL_BIN\" --datadir=\"$data_dir\" --basedir=\"$SQL_DIR\" --socket=\"$SOCKET_FILE\" --port=\"$SQL_PORT\" --bind-address=\"$SQL_HOST\" --pid-file=\"$PIDFILE.mysqld\" --log-error=\"$error_log\" --general-log --general-log-file=\"$general_log\" --daemonize"
+    # Build server command - check if --daemonize is supported
+    local daemon_option=""
+    if "$SQL_BIN" --help --verbose 2>/dev/null | grep -q -- "--daemonize"; then
+        daemon_option="--daemonize"
+        log_message "DEBUG" "Using --daemonize option"
+    else
+        log_message "DEBUG" "MariaDB version does not support --daemonize, starting in background mode"
+    fi
+    
+    local start_command="\"$SQL_BIN\" --datadir=\"$data_dir\" --basedir=\"$SQL_DIR\" --socket=\"$SOCKET_FILE\" --port=\"$SQL_PORT\" --bind-address=\"$SQL_HOST\" --pid-file=\"$PIDFILE.mysqld\" --log-error=\"$error_log\" --general-log --general-log-file=\"$general_log\" $daemon_option"
 
     # Log server start details
     log_message "INFO" "Starting ${SQL_ENGINE^} server at $SQL_HOST:$SQL_PORT"
@@ -833,11 +843,26 @@ start_server() {
     log_message "INFO" "  Error log: $error_log"
     [[ "$PROFILE" != "default" ]] && log_message "INFO" "  Profile: $PROFILE"
 
-    # Start server
-    eval "$start_command" || {
-        log_message "ERROR" "Failed to start ${SQL_ENGINE^} server. Check error log: $error_log"
-        return 1
-    }
+    # Start server - always run in background to free the console
+    log_message "DEBUG" "Starting server with command: $start_command"
+    if [ -n "$daemon_option" ]; then
+        # Use daemonize option if available
+        eval "$start_command" || {
+            log_message "ERROR" "Failed to start ${SQL_ENGINE^} server. Check error log: $error_log"
+            return 1
+        }
+    else
+        # Start in background for older MariaDB versions or when daemonize not available
+        eval "$start_command" > /dev/null 2>&1 &
+        local bg_pid=$!
+        # Give it a moment to start
+        sleep 1
+        # Check if the background process is still running (didn't immediately fail)
+        if ! kill -0 "$bg_pid" 2>/dev/null; then
+            log_message "ERROR" "Failed to start ${SQL_ENGINE^} server. Check error log: $error_log"
+            return 1
+        fi
+    fi
 
     # Wait for SQL PID file to be created
     local attempt=0 max_attempts=10
@@ -1097,7 +1122,7 @@ restart_server() {
 connect_sql() {
     # Check if server is running
     if ! manage_pidfile check; then
-        log_message "ERROR" "SQL server is not running. Start it first with: sqlmate start"
+        log_message "ERROR" "SQL server is not running. Start it first with: sqmate start"
         return 1
     fi
 
@@ -1106,18 +1131,209 @@ connect_sql() {
     socket_file=$(manage_pidfile get_value "SOCKET_FILE")
     sql_engine=$(manage_pidfile get_value "SQL_ENGINE")
     
-    # Find mysql client
-    local mysql_client="${SQL_DIR}/bin/mysql"
-    if ! validate_path "$mysql_client" "file" "SQL client"; then
-        log_message "ERROR" "SQL client not found at: $mysql_client"
+    # Find SQL client - prefer mariadb over mysql for MariaDB installations
+    local sql_client=""
+    if [ "$sql_engine" = "mariadb" ]; then
+        # For MariaDB, prefer mariadb client over mysql client
+        if [ -f "${SQL_DIR}/bin/mariadb" ]; then
+            sql_client="${SQL_DIR}/bin/mariadb"
+            log_message "DEBUG" "Using mariadb client"
+        elif [ -f "${SQL_DIR}/bin/mysql" ]; then
+            sql_client="${SQL_DIR}/bin/mysql"
+            log_message "DEBUG" "Using mysql client (mariadb client not found)"
+        fi
+    else
+        # For MySQL, use mysql client
+        sql_client="${SQL_DIR}/bin/mysql"
+        log_message "DEBUG" "Using mysql client"
+    fi
+    
+    if [ -z "$sql_client" ] || ! validate_path "$sql_client" "file" "SQL client"; then
+        log_message "ERROR" "SQL client not found. Expected: ${SQL_DIR}/bin/mariadb or ${SQL_DIR}/bin/mysql"
         return 1
     fi
 
     log_message "INFO" "Connecting to ${sql_engine^} server..."
-    log_message "INFO" "Use Ctrl+C to exit the client"
     
-    # Connect to SQL server
-    "$mysql_client" -u root -p --socket="$socket_file"
+    # For MariaDB with authentication issues, try multiple approaches
+    if [ "$sql_engine" = "mariadb" ]; then
+        log_message "INFO" "Attempting connection without password (MariaDB default)..."
+        
+        # Try connection without password first
+        if "$sql_client" -u root --socket="$socket_file" -e "SELECT 1;" >/dev/null 2>&1; then
+            log_message "SUCCESS" "Connected without password. Starting interactive session..."
+            "$sql_client" -u root --socket="$socket_file"
+        else
+            log_message "INFO" "No-password connection failed. Trying system user authentication..."
+            
+            # Try with current system user (unix_socket plugin)
+            local current_user
+            current_user=$(whoami)
+            if "$sql_client" -u "$current_user" --socket="$socket_file" -e "SELECT 1;" >/dev/null 2>&1; then
+                log_message "SUCCESS" "Connected as system user '$current_user'. Starting interactive session..."
+                log_message "INFO" "Note: You're connected as '$current_user', not 'root'"
+                "$sql_client" -u "$current_user" --socket="$socket_file"
+            else
+                log_message "INFO" "System user authentication failed. Trying with password..."
+                log_message "INFO" "Please enter the root password (press Enter if no password):"
+                "$sql_client" -u root -p --socket="$socket_file"
+            fi
+        fi
+    else
+        # For MySQL, always prompt for password
+        log_message "INFO" "Please enter the root password:"
+        "$sql_client" -u root -p --socket="$socket_file"
+    fi
+    
+    # If all connection attempts failed, provide troubleshooting info
+    if [ $? -ne 0 ]; then
+        echo ""
+        log_message "ERROR" "Connection failed. Here are some troubleshooting options:"
+        echo ""
+        echo "1. Reset MariaDB root authentication:"
+        echo "   sqmate stop"
+        echo "   sqmate reset-auth  # (if implemented)"
+        echo ""
+        echo "2. Manual reset (advanced):"
+        echo "   # Stop server and start in safe mode"
+        echo "   sqmate stop"
+        echo "   $SQL_BIN --skip-grant-tables --socket=/tmp/temp.sock \\"
+        echo "     --datadir=\"${SQL_DIR}/data\" &"
+        echo ""
+        echo "   # Connect and fix authentication"
+        echo "   $sql_client -u root --socket=/tmp/temp.sock"
+        echo "   # In MariaDB, run:"
+        echo "   #   FLUSH PRIVILEGES;"
+        echo "   #   ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('');"
+        echo "   #   EXIT;"
+        echo ""
+        echo "   # Kill safe mode and restart normally"
+        echo "   pkill $(basename "$SQL_BIN")"
+        echo "   sqmate start"
+        echo ""
+        echo "3. Check if you need to run as a different user:"
+        echo "   Current system user: $(whoami)"
+        echo "   Try: $sql_client -u $(whoami) --socket=\"$socket_file\""
+    fi
+}
+
+# Function: resets MariaDB/MySQL authentication
+reset_auth() {
+    # Validate SQL installation
+    validate_sql || return 1
+    
+    local sql_engine="$SQL_ENGINE"
+    local data_dir="${SQL_DIR}/data"
+    
+    log_message "INFO" "Resetting ${sql_engine^} authentication..."
+    
+    # Check if server is running and stop it
+    if manage_pidfile check; then
+        log_message "INFO" "Stopping running server..."
+        stop_server || {
+            log_message "ERROR" "Failed to stop running server"
+            return 1
+        }
+    fi
+    
+    # Wait a moment for cleanup
+    sleep 2
+    
+    # Start server in safe mode
+    local temp_socket="/tmp/sqmate_reset_$.sock"
+    local temp_pid="/tmp/sqmate_reset_$.pid"
+    
+    log_message "INFO" "Starting server in safe mode (skip authentication)..."
+    "$SQL_BIN" --skip-grant-tables --skip-networking \
+        --socket="$temp_socket" \
+        --pid-file="$temp_pid" \
+        --datadir="$data_dir" \
+        --basedir="$SQL_DIR" &
+    
+    local safe_pid=$!
+    
+    # Wait for server to start
+    local attempt=0 max_attempts=10
+    while [ "$attempt" -lt "$max_attempts" ]; do
+        if [ -S "$temp_socket" ]; then
+            break
+        fi
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+    
+    if [ "$attempt" -eq "$max_attempts" ]; then
+        log_message "ERROR" "Failed to start server in safe mode"
+        kill -9 "$safe_pid" 2>/dev/null
+        rm -f "$temp_socket" "$temp_pid"
+        return 1
+    fi
+    
+    # Find SQL client
+    local sql_client=""
+    if [ "$sql_engine" = "mariadb" ]; then
+        if [ -f "${SQL_DIR}/bin/mariadb" ]; then
+            sql_client="${SQL_DIR}/bin/mariadb"
+        elif [ -f "${SQL_DIR}/bin/mysql" ]; then
+            sql_client="${SQL_DIR}/bin/mysql"
+        fi
+    else
+        sql_client="${SQL_DIR}/bin/mysql"
+    fi
+    
+    if [ -z "$sql_client" ]; then
+        log_message "ERROR" "SQL client not found"
+        kill -9 "$safe_pid" 2>/dev/null
+        rm -f "$temp_socket" "$temp_pid"
+        return 1
+    fi
+    
+    log_message "INFO" "Resetting root user authentication..."
+    
+    # Reset authentication based on engine type
+    if [ "$sql_engine" = "mariadb" ]; then
+        # For MariaDB, set up native password authentication
+        "$sql_client" -u root --socket="$temp_socket" <<EOF
+FLUSH PRIVILEGES;
+ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('');
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+FLUSH PRIVILEGES;
+EOF
+    else
+        # For MySQL
+        "$sql_client" -u root --socket="$temp_socket" <<EOF
+FLUSH PRIVILEGES;
+ALTER USER 'root'@'localhost' IDENTIFIED BY '';
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+FLUSH PRIVILEGES;
+EOF
+    fi
+    
+    local reset_result=$?
+    
+    # Stop safe mode server
+    log_message "INFO" "Stopping safe mode server..."
+    kill -TERM "$safe_pid" 2>/dev/null
+    sleep 2
+    if kill -0 "$safe_pid" 2>/dev/null; then
+        kill -9 "$safe_pid" 2>/dev/null
+    fi
+    
+    # Clean up temp files
+    rm -f "$temp_socket" "$temp_pid"
+    
+    if [ "$reset_result" -eq 0 ]; then
+        log_message "SUCCESS" "Authentication reset successfully!"
+        log_message "INFO" "Root user now has no password and uses native password authentication"
+        log_message "INFO" "You can now start the server and connect:"
+        echo "  sqmate start"
+        echo "  sqmate connect"
+    else
+        log_message "ERROR" "Failed to reset authentication"
+        return 1
+    fi
+    
+    return 0
 }
 
 # Function: shows recent logs
@@ -1132,7 +1348,7 @@ show_logs() {
         echo "----------------------------------------"
     else
         log_message "WARNING" "${engine_name} error log file not found: $error_log"
-        log_message "INFO" "Server may not be initialized. Run 'sqlmate init' first."
+        log_message "INFO" "Server may not be initialized. Run 'sqmate init' first."
     fi
 }
 
@@ -1175,6 +1391,9 @@ main() {
             ;;
         logs)
             show_logs
+            ;;
+        reset-auth)
+            reset_auth
             ;;
         version)
             show_version

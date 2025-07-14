@@ -13,8 +13,10 @@ SQMATE is a lightweight command-line utility that simplifies management of porta
 - **Engine-Specific Initialization**: 
   - MySQL: Uses `mysqld --initialize` (generates temporary root password)
   - MariaDB: Uses `mysql_install_db` or `mysqld --initialize-insecure` (no password)
+- **Authentication Reset**: Built-in `reset-auth` command to fix login issues
 - **Custom Host/Port**: Run servers on custom hostnames and ports
 - **Socket Connection**: Secure local connections via Unix domain sockets
+- **GUI Tool Compatible**: Works with database management tools like Navicat, phpMyAdmin, etc.
 - **Robust Error Handling**: Comprehensive error checking, validation, and detailed logs
 - **Logging**: Detailed logs with configurable verbosity levels (DEBUG, INFO, WARNING, ERROR)
 - **Status Monitoring**: View running server status including uptime and process information
@@ -52,6 +54,16 @@ SQMATE is a lightweight command-line utility that simplifies management of porta
    sqmate version
    ```
 
+### Arch Linux Installation
+
+For Arch Linux users, install the required compatibility library:
+
+```bash
+sudo pacman -S libxcrypt-compat
+```
+
+This provides the `libcrypt.so.1` library needed by portable MySQL/MariaDB binaries.
+
 ## Getting Started
 
 ### Step 1: Download MySQL or MariaDB
@@ -69,11 +81,11 @@ tar -xf mysql-8.0.39-linux-glibc2.28-x86_64.tar.xz
 
 #### MariaDB  
 ```bash
-# Download MariaDB 10.11 (example for Linux x86_64)
-wget https://downloads.mariadb.org/rest-api/mariadb/10.11.5/mariadb-10.11.5-linux-systemd-x86_64.tar.gz
+# Download MariaDB 11.8 (example for Linux x86_64)
+wget https://downloads.mariadb.org/rest-api/mariadb/11.8.2/mariadb-11.8.2-linux-systemd-x86_64.tar.gz
 
 # Extract
-tar -xzf mariadb-10.11.5-linux-systemd-x86_64.tar.gz
+tar -xzf mariadb-11.8.2-linux-systemd-x86_64.tar.gz
 ```
 
 ### Step 2: Initialize Your Database
@@ -85,7 +97,7 @@ Run the initialization command and provide the path to your extracted database:
 sqmate init
 
 # Or specify the directory directly
-sqmate init --sql-dir=/opt/mysql-8.0.39-linux-glibc2.28-x86_64
+sqmate init --sql-dir=/opt/mariadb-11.8.2-linux-systemd-x86_64
 ```
 
 SQMATE will automatically:
@@ -123,6 +135,7 @@ sqmate status             # Check server status
 # Database operations
 sqmate connect            # Connect to the database
 sqmate logs               # View recent error logs
+sqmate reset-auth         # Fix authentication issues
 
 # Configuration
 sqmate config             # Show current configuration
@@ -141,7 +154,7 @@ sqmate init --profile=mysql8 --sql-dir=/opt/mysql-8.0.39
 sqmate start --profile=mysql8 --port=3306
 
 # Set up MariaDB on port 3307
-sqmate init --profile=mariadb11 --sql-dir=/opt/mariadb-10.11.5
+sqmate init --profile=mariadb11 --sql-dir=/opt/mariadb-11.8.2
 sqmate start --profile=mariadb11 --port=3307
 
 # Both servers are now running!
@@ -197,6 +210,7 @@ sqmate stop --profile=dev
 | `status` | Show server status |
 | `connect` | Connect to database server |
 | `logs` | Show recent error logs |
+| `reset-auth` | **Reset database authentication (fixes login issues)** |
 | `config` | Show current configuration |
 | `version` | Show version information |
 | `help` | Display help information |
@@ -219,6 +233,9 @@ sqmate init
 sqmate start
 sqmate connect
 
+# Fix authentication issues
+sqmate reset-auth
+
 # With custom options
 sqmate start --host=0.0.0.0 --port=3307
 sqmate start --profile=dev --port=3306
@@ -233,6 +250,43 @@ sqmate start --profile=mariadb11
 sqmate status --profile=mysql8      # Check MySQL status
 sqmate status --profile=mariadb11   # Check MariaDB status
 ```
+
+## GUI Database Management Tools
+
+SQMATE works seamlessly with database management GUIs like Navicat, phpMyAdmin, DBeaver, etc.
+
+### Connection Settings for GUI Tools:
+
+```
+Host: 127.0.0.1  (use IP, not "localhost")
+Port: 3306
+Username: root
+Password: (leave empty for default MariaDB setup)
+Connection Type: TCP/IP (not socket)
+```
+
+### If GUI Connection Fails:
+
+1. **Reset authentication** (most common fix):
+   ```bash
+   sqmate reset-auth
+   sqmate start
+   ```
+
+2. **Verify server is running**:
+   ```bash
+   sqmate status
+   ```
+
+3. **Test command-line connection first**:
+   ```bash
+   sqmate connect
+   ```
+
+4. **Check TCP connectivity**:
+   ```bash
+   ss -tuln | grep 3306  # Should show MariaDB listening on port 3306
+   ```
 
 ## Configuration
 
@@ -264,6 +318,7 @@ SQMATE uses profiles to manage multiple database configurations:
 
 ### MySQL
 
+- **Binary**: Uses `mysqld`
 - **Initialization**: Uses `mysqld --initialize`
 - **Root Password**: Generates a temporary password (check error log)
 - **Password Change**: Required on first connection
@@ -273,8 +328,10 @@ SQMATE uses profiles to manage multiple database configurations:
 
 ### MariaDB
 
+- **Binary**: Prefers `mariadbd` over `mysqld` (eliminates deprecation warnings)
 - **Initialization**: Prefers `mysql_install_db`, falls back to `mysqld --initialize-insecure`
 - **Root Password**: No password set by default
+- **Authentication**: Uses native password authentication after `reset-auth`
 - **Password Setup**: Optional, can be set after connection
   ```sql
   SET PASSWORD FOR 'root'@'localhost' = PASSWORD('your_password');
@@ -282,16 +339,37 @@ SQMATE uses profiles to manage multiple database configurations:
 
 ## Troubleshooting
 
-### Common Issues
+### Common Issues and Solutions
 
 | Issue | Solution |
 |-------|----------|
-| "SQL directory not configured" | Run `sqmate init` first |
-| "Data directory not initialized" | Run `sqmate init` to create system tables |
-| "Port in use" | Another server is running; use different port or `sqmate stop` |
-| "Process not found" | Stale PID file; run `sqmate stop` to clean up |
-| "Permission denied" | Ensure script is executable: `chmod +x sqmate` |
-| "Connection refused" | Check if server is running: `sqmate status` |
+| **"SQL directory not configured"** | Run `sqmate init` first |
+| **"Data directory not initialized"** | Run `sqmate init` to create system tables |
+| **"Port in use"** | Another server is running; use different port or `sqmate stop` |
+| **"Process not found"** | Stale PID file; run `sqmate stop` to clean up |
+| **"Permission denied"** | Ensure script is executable: `chmod +x sqmate` |
+| **"Connection refused"** | Check if server is running: `sqmate status` |
+| **"Access denied for user 'root'"** | **Run `sqmate reset-auth` to fix authentication** |
+| **GUI tools can't connect** | **Run `sqmate reset-auth` and use TCP/IP connection** |
+| **"libcrypt.so.1 not found" (Arch Linux)** | Install: `sudo pacman -S libxcrypt-compat` |
+| **Deprecation warnings** | SQMATE automatically uses modern binaries (`mariadbd`, `mariadb`) |
+
+### Authentication Issues (Most Common)
+
+If you can't connect to your database or get "Access denied" errors:
+
+```bash
+# Quick fix for most authentication issues
+sqmate reset-auth
+sqmate start
+sqmate connect  # Should work without password
+```
+
+The `reset-auth` command:
+- ✅ Safely resets root user authentication
+- ✅ Sets up native password authentication
+- ✅ Removes password requirement
+- ✅ Fixes GUI tool connectivity issues
 
 ### Debugging
 
@@ -308,6 +386,9 @@ sqmate config
 # Check database error logs directly
 tail -f ~/.config/sqmate/sqmate_<profile>.log
 tail -f <sql-dir>/logs/mysqld_error.log
+
+# Check if TCP port is listening
+ss -tuln | grep 3306
 ```
 
 ### Log Files
@@ -323,7 +404,7 @@ tail -f <sql-dir>/logs/mysqld_error.log
 ```bash
 # Set up both MySQL and MariaDB for testing
 sqmate init --profile=mysql --sql-dir=/opt/mysql-8.0.39
-sqmate init --profile=mariadb --sql-dir=/opt/mariadb-10.11.5
+sqmate init --profile=mariadb --sql-dir=/opt/mariadb-11.8.2
 
 # Start both on different ports
 sqmate start --profile=mysql --port=3306
@@ -353,13 +434,13 @@ sqmate init --profile=mysql80 --sql-dir=/opt/mysql-8.0.39
 
 # Different MariaDB versions  
 sqmate init --profile=mariadb103 --sql-dir=/opt/mariadb-10.3.39
-sqmate init --profile=mariadb1011 --sql-dir=/opt/mariadb-10.11.5
+sqmate init --profile=mariadb118 --sql-dir=/opt/mariadb-11.8.2
 
 # Run all simultaneously on different ports
 sqmate start --profile=mysql57 --port=3306
 sqmate start --profile=mysql80 --port=3307
 sqmate start --profile=mariadb103 --port=3308
-sqmate start --profile=mariadb1011 --port=3309
+sqmate start --profile=mariadb118 --port=3309
 ```
 
 ## Security Considerations
@@ -367,7 +448,7 @@ sqmate start --profile=mariadb1011 --port=3309
 - **Local Binding**: By default, servers bind to localhost only
 - **Socket Connections**: Local connections use secure Unix domain sockets
 - **Network Access**: Use `--host=0.0.0.0` only when needed for external access
-- **Password Management**: Change default passwords immediately after setup
+- **Password Management**: Use `reset-auth` to set up secure authentication
 - **File Permissions**: Configuration files are protected with 600 permissions
 
 ## License
@@ -395,12 +476,19 @@ sqmate start        # Start server
 sqmate connect      # Connect to database  
 sqmate stop         # Stop server
 
+# Fix authentication issues
+sqmate reset-auth   # Fixes most login problems
+
 # Multiple databases
 sqmate start --profile=mysql8 --port=3306
 sqmate start --profile=mariadb11 --port=3307
+
+# GUI tool setup
+# Host: 127.0.0.1, Port: 3306, User: root, Password: (empty)
 
 # Troubleshooting
 sqmate status       # Check if running
 sqmate logs         # View error logs
 sqmate restart      # Restart server
+sqmate reset-auth   # Fix authentication
 ```

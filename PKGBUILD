@@ -6,7 +6,7 @@ pkgdesc="A lightweight command-line utility that simplifies management of portab
 arch=('any')
 url="https://github.com/dlzi/sqmate"
 license=('MIT')
-depends=('bash>=4.4')
+depends=('bash>=4.4' 'libxcrypt-compat')
 optdepends=(
     'bash-completion: for command-line completion'
     'mysql: for MySQL database engine support'
