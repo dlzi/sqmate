@@ -3,7 +3,7 @@
 # SQMATE - Universal SQL Server Manager
 # A lightweight tool to manage MySQL and MariaDB portable installations for local development.
 #
-# Based on the design patterns of PHMATE by Daniel Zilli
+# Copyright (C) 2025, Daniel Zilli. All rights reserved.
 #
 
 # Exit on error, undefined vars, and error in pipes.
@@ -19,8 +19,9 @@ VERSION="1.0.0"
 PROFILE="default"
 CONFIG_DIR="${SQMATE_CONFIG_DIR:-${HOME}/.config/sqmate}"
 CONFIG_FILE="${CONFIG_DIR}/config_${PROFILE}"
-PIDFILE="${CONFIG_DIR}/sqmate.pid"
-LOGFILE="${CONFIG_DIR}/sqmate.log"
+PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.pid"
+SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.server.pid"
+LOGFILE="${CONFIG_DIR}/sqmate_${PROFILE}.log"
 SOCKET_FILE="/tmp/sqmate_${PROFILE}.sock"
 SQL_BIN=""
 
@@ -183,7 +184,7 @@ EOF
 
         cleanup)
             # Remove PID file
-            rm -f "$PIDFILE" 2> /dev/null
+            cleanup_pid_files "$PROFILE"
             return 0
             ;;
     esac
@@ -483,6 +484,7 @@ parse_options() {
                 PROFILE="${arg#*=}"
                 CONFIG_FILE="${CONFIG_DIR}/config_${PROFILE}"
                 PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.pid"
+                SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.server.pid"
                 LOGFILE="${CONFIG_DIR}/sqmate_${PROFILE}.log"
                 SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
                 shift
@@ -563,6 +565,7 @@ load_config() {
 
     # Update dependent variables
     PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.pid"
+    SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.server.pid"
     LOGFILE="${CONFIG_DIR}/sqmate_${PROFILE}.log"
     SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
 
@@ -629,6 +632,24 @@ show_config() {
 }
 
 # --- Server Management ---
+
+# Function: Clean up all PID-related files for current profile
+cleanup_pid_files() {
+    local profile="${1:-$PROFILE}"
+    
+    log_message "DEBUG" "Cleaning up all files for profile: $profile"
+    
+    # Remove SQMATE tracking PID
+    rm -f "${CONFIG_DIR}/sqmate_${profile}.pid" 2>/dev/null
+    
+    # Remove server PID
+    rm -f "${CONFIG_DIR}/sqmate_${profile}.server.pid" 2>/dev/null
+    
+    # Remove socket file(s) for this profile
+    rm -f "/tmp/sqmate_${profile}_"*.sock 2>/dev/null
+    
+    # Could also clean up stale entries from other profiles if needed
+}
 
 # Function: finds processes listening on a specified port.
 find_port_processes() {
@@ -834,7 +855,7 @@ start_server() {
         log_message "DEBUG" "MariaDB version does not support --daemonize, starting in background mode"
     fi
     
-    local start_command="\"$SQL_BIN\" --datadir=\"$data_dir\" --basedir=\"$SQL_DIR\" --socket=\"$SOCKET_FILE\" --port=\"$SQL_PORT\" --bind-address=\"$SQL_HOST\" --pid-file=\"$PIDFILE.mysqld\" --log-error=\"$error_log\" --general-log --general-log-file=\"$general_log\" $daemon_option"
+    local start_command="\"$SQL_BIN\" --datadir=\"$data_dir\" --basedir=\"$SQL_DIR\" --socket=\"$SOCKET_FILE\" --port=\"$SQL_PORT\" --bind-address=\"$SQL_HOST\" --pid-file=\"$SERVER_PIDFILE\" --log-error=\"$error_log\" --general-log --general-log-file=\"$general_log\" $daemon_option"
 
     # Log server start details
     log_message "INFO" "Starting ${SQL_ENGINE^} server at $SQL_HOST:$SQL_PORT"
@@ -868,8 +889,8 @@ start_server() {
     local attempt=0 max_attempts=10
     local sql_pid=""
     while [ "$attempt" -lt "$max_attempts" ]; do
-        if [ -f "${PIDFILE}.mysqld" ]; then
-            sql_pid=$(cat "${PIDFILE}.mysqld" 2>/dev/null)
+        if [ -f "$SERVER_PIDFILE" ]; then
+            sql_pid=$(cat "$SERVER_PIDFILE" 2>/dev/null)
             if [ -n "$sql_pid" ] && kill -0 "$sql_pid" 2>/dev/null; then
                 break
             fi
@@ -880,6 +901,8 @@ start_server() {
 
     if [ -z "$sql_pid" ] || ! kill -0 "$sql_pid" 2>/dev/null; then
         log_message "ERROR" "${SQL_ENGINE^} server failed to start properly. Check error log: $error_log"
+        # Clean up the server PID file if it exists
+        rm -f "$SERVER_PIDFILE" 2>/dev/null
         return 1
     fi
 
@@ -993,12 +1016,8 @@ stop_server() {
         failed=1
     fi
 
-    # Clean up PID files
-    manage_pidfile cleanup
-    rm -f "${PIDFILE}.mysqld" 2>/dev/null
-    
-    # Clean up socket file
-    rm -f "$SOCKET_FILE" 2>/dev/null
+    # Clean up all PID-related files
+    cleanup_pid_files "$PROFILE"
 
     # Report result
     if [ "$failed" -eq 0 ]; then
