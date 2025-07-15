@@ -54,15 +54,49 @@ SQMATE is a lightweight command-line utility that simplifies management of porta
    sqmate version
    ```
 
-### Arch Linux Installation
+### Using Makefile
 
-For Arch Linux users, install the required compatibility library:
+If you've cloned the repository, you can use the provided Makefile for a complete installation including documentation and bash completion:
 
 ```bash
-sudo pacman -S libxcrypt-compat
+git clone https://github.com/dlzi/sqmate.git
+cd sqmate
+make install
 ```
 
-This provides the `libcrypt.so.1` library needed by portable MySQL/MariaDB binaries.
+This will install sqmate to `/usr/local/bin/sqmate` by default. To install to a different location:
+
+```bash
+make install PREFIX=~/.local
+```
+
+To uninstall sqmate when installed with the Makefile:
+
+```bash
+make uninstall
+```
+
+### Using install.sh Script
+
+The repository includes an installation script that properly installs all components including documentation and bash completion:
+
+```bash
+git clone https://github.com/dlzi/sqmate.git
+cd sqmate
+./install.sh
+```
+
+You can customize the installation directories by setting environment variables:
+
+```bash
+PREFIX=~/.local ./install.sh
+```
+
+To uninstall sqmate when installed with the install script:
+
+```bash
+./uninstall.sh
+```
 
 ## Getting Started
 
@@ -72,21 +106,31 @@ Download a portable installation of your preferred database:
 
 #### MySQL
 ```bash
-# Download MySQL 8.0 (example for Linux x86_64)
-wget https://dev.mysql.com/get/Downloads/MySQL-8.0/mysql-8.0.39-linux-glibc2.28-x86_64.tar.xz
+# Download MySQL 9.x (example for Linux x86_64)
+wget https://dev.mysql.com/get/Downloads/MySQL-9.3/mysql-9.3.0-linux-glibc2.28-x86_64.tar.xz
 
 # Extract
-tar -xf mysql-8.0.39-linux-glibc2.28-x86_64.tar.xz
+tar -xf mysql-9.3.0-linux-glibc2.28-x86_64.tar.xz
 ```
 
 #### MariaDB  
 ```bash
-# Download MariaDB 11.8 (example for Linux x86_64)
+# Download MariaDB 11.x (example for Linux x86_64)
 wget https://downloads.mariadb.org/rest-api/mariadb/11.8.2/mariadb-11.8.2-linux-systemd-x86_64.tar.gz
 
 # Extract
 tar -xzf mariadb-11.8.2-linux-systemd-x86_64.tar.gz
 ```
+
+### Compatibility Notes
+
+Some portable MySQL/MariaDB binaries may require the `libcrypt.so.1` library. If you encounter library errors, you may need to install compatibility libraries:
+
+- **Arch Linux**: `sudo pacman -S libxcrypt-compat`
+- **Ubuntu/Debian**: Usually included by default
+- **CentOS/RHEL**: `sudo yum install libxcrypt-compat` or `sudo dnf install libxcrypt-compat`
+
+This provides the `libcrypt.so.1` library needed by portable MySQL/MariaDB binaries.
 
 ### Step 2: Initialize Your Database
 
@@ -140,61 +184,6 @@ sqmate reset-auth         # Fix authentication issues
 # Configuration
 sqmate config             # Show current configuration
 sqmate init               # Initialize new database
-```
-
-### Advanced Usage
-
-#### Multiple Database Instances
-
-You can run multiple database servers simultaneously using profiles:
-
-```bash
-# Set up MySQL on port 3306
-sqmate init --profile=mysql8 --sql-dir=/opt/mysql-8.0.39
-sqmate start --profile=mysql8 --port=3306
-
-# Set up MariaDB on port 3307
-sqmate init --profile=mariadb11 --sql-dir=/opt/mariadb-11.8.2
-sqmate start --profile=mariadb11 --port=3307
-
-# Both servers are now running!
-sqmate status --profile=mysql8     # Shows MySQL status
-sqmate status --profile=mariadb11  # Shows MariaDB status
-
-# Connect to specific database
-sqmate connect --profile=mysql8
-sqmate connect --profile=mariadb11
-```
-
-#### Custom Host and Port
-
-```bash
-# Start on all interfaces with custom port
-sqmate start --host=0.0.0.0 --port=3307
-
-# Start with hostname:port format
-sqmate start localhost:3307
-sqmate start 0.0.0.0:3308
-```
-
-#### Development Workflow
-
-```bash
-# Set up development environment
-sqmate init --profile=dev --sql-dir=/path/to/mysql
-sqmate start --profile=dev
-
-# Work on your project...
-sqmate connect --profile=dev
-
-# View logs when debugging
-sqmate logs --profile=dev
-
-# Restart when needed (preserves configuration)
-sqmate restart --profile=dev
-
-# Stop when done
-sqmate stop --profile=dev
 ```
 
 ## Command Reference
@@ -261,7 +250,7 @@ SQMATE works seamlessly with database management GUIs like Navicat, phpMyAdmin, 
 Host: 127.0.0.1  (use IP, not "localhost")
 Port: 3306
 Username: root
-Password: (leave empty for default MariaDB setup)
+Password: (leave empty)
 Connection Type: TCP/IP (not socket)
 ```
 
@@ -397,52 +386,6 @@ ss -tuln | grep 3306
 - **Database error logs**: `<sql-dir>/logs/mysqld_error.log`
 - **Database general logs**: `<sql-dir>/logs/mysqld_general.log`
 
-## Advanced Scenarios
-
-### Testing Database Compatibility
-
-```bash
-# Set up both MySQL and MariaDB for testing
-sqmate init --profile=mysql --sql-dir=/opt/mysql-8.0.39
-sqmate init --profile=mariadb --sql-dir=/opt/mariadb-11.8.2
-
-# Start both on different ports
-sqmate start --profile=mysql --port=3306
-sqmate start --profile=mariadb --port=3307
-
-# Test your application against both
-sqmate connect --profile=mysql    # Test with MySQL
-sqmate connect --profile=mariadb  # Test with MariaDB
-```
-
-### Development Team Setup
-
-```bash
-# Each team member can use the same commands
-sqmate init --profile=project-dev --sql-dir=/path/to/shared/mysql
-sqmate start --profile=project-dev --port=3306
-
-# Consistent development environment across team
-```
-
-### Multiple Versions
-
-```bash
-# Different MySQL versions
-sqmate init --profile=mysql57 --sql-dir=/opt/mysql-5.7.44
-sqmate init --profile=mysql80 --sql-dir=/opt/mysql-8.0.39
-
-# Different MariaDB versions  
-sqmate init --profile=mariadb103 --sql-dir=/opt/mariadb-10.3.39
-sqmate init --profile=mariadb118 --sql-dir=/opt/mariadb-11.8.2
-
-# Run all simultaneously on different ports
-sqmate start --profile=mysql57 --port=3306
-sqmate start --profile=mysql80 --port=3307
-sqmate start --profile=mariadb103 --port=3308
-sqmate start --profile=mariadb118 --port=3309
-```
-
 ## Security Considerations
 
 - **Local Binding**: By default, servers bind to localhost only
@@ -461,7 +404,7 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 
 ## Author
 
-Based on the design patterns of PHMATE by Daniel Zilli.
+Daniel Zilli.
 
 ---
 
