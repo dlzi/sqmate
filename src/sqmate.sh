@@ -15,14 +15,14 @@ SQL_HOST="localhost"
 SQL_PORT="3306"
 SQL_DIR=""
 SQL_ENGINE=""  # mysql or mariadb (auto-detected)
-VERSION="1.0.0"
+VERSION="1.0.1"
 PROFILE="default"
 CONFIG_DIR="${SQMATE_CONFIG_DIR:-${HOME}/.config/sqmate}"
 CONFIG_FILE="${CONFIG_DIR}/config_${PROFILE}"
 PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.pid"
-SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.server.pid"
+SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}_${SQL_PORT}.server.pid"
 LOGFILE="${CONFIG_DIR}/sqmate_${PROFILE}.log"
-SOCKET_FILE="/tmp/sqmate_${PROFILE}.sock"
+SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
 SQL_BIN=""
 
 declare -A LOG_LEVELS=([DEBUG]=0 [INFO]=1 [WARNING]=2 [ERROR]=3)
@@ -259,7 +259,6 @@ show_version() {
     echo "SQMATE - Universal SQL Server Manager"
     echo "Version: ${VERSION}"
     echo "Supports: MySQL and MariaDB portable installations"
-    echo "Based on PHMATE design patterns by Daniel Zilli"
 }
 
 # --- Validation Functions ---
@@ -460,9 +459,11 @@ parse_hostport() {
 
     # Update socket file with new profile/port
     SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
+    SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}_${SQL_PORT}.server.pid"
 
     # Log result
     log_message "DEBUG" "Parsed host:port as HOST=$SQL_HOST, PORT=$SQL_PORT"
+
     return 0
 }
 
@@ -484,7 +485,7 @@ parse_options() {
                 PROFILE="${arg#*=}"
                 CONFIG_FILE="${CONFIG_DIR}/config_${PROFILE}"
                 PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.pid"
-                SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.server.pid"
+                SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}_${SQL_PORT}.server.pid"
                 LOGFILE="${CONFIG_DIR}/sqmate_${PROFILE}.log"
                 SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
                 shift
@@ -498,6 +499,7 @@ parse_options() {
                 SQL_PORT="${arg#*=}"
                 validate_port "$SQL_PORT" || return 1
                 SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
+                SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}_${SQL_PORT}.server.pid"
                 shift
                 ;;
             --debug)
@@ -565,7 +567,7 @@ load_config() {
 
     # Update dependent variables
     PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.pid"
-    SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.server.pid"
+    SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}_${SQL_PORT}.server.pid"
     LOGFILE="${CONFIG_DIR}/sqmate_${PROFILE}.log"
     SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
 
@@ -642,8 +644,8 @@ cleanup_pid_files() {
     # Remove SQMATE tracking PID
     rm -f "${CONFIG_DIR}/sqmate_${profile}.pid" 2>/dev/null
     
-    # Remove server PID
-    rm -f "${CONFIG_DIR}/sqmate_${profile}.server.pid" 2>/dev/null
+    # Remove server PID files (with port patterns)
+    rm -f "${CONFIG_DIR}/sqmate_${profile}_"*.server.pid 2>/dev/null
     
     # Remove socket file(s) for this profile
     rm -f "/tmp/sqmate_${profile}_"*.sock 2>/dev/null
@@ -976,8 +978,7 @@ stop_server() {
     if [ "$found_server" -eq 0 ]; then
         log_message "INFO" "No running SQL server found"
         manage_pidfile cleanup
-        # Clean up SQL's own PID file
-        rm -f "${PIDFILE}.mysqld" 2>/dev/null
+
         return 0
     fi
 
@@ -1204,23 +1205,25 @@ connect_sql() {
         "$sql_client" -u root -p --socket="$socket_file"
     fi
     
+    local connection_result=$?
+
     # If all connection attempts failed, provide troubleshooting info
-    if [ $? -ne 0 ]; then
+    if [ $connection_result -ne 0 ]; then
         echo ""
         log_message "ERROR" "Connection failed. Here are some troubleshooting options:"
         echo ""
         echo "1. Reset MariaDB root authentication:"
         echo "   sqmate stop"
-        echo "   sqmate reset-auth  # (if implemented)"
+        echo "   sqmate reset-auth"
         echo ""
         echo "2. Manual reset (advanced):"
         echo "   # Stop server and start in safe mode"
         echo "   sqmate stop"
-        echo "   $SQL_BIN --skip-grant-tables --socket=/tmp/temp.sock \\"
+        echo "   $SQL_BIN --skip-grant-tables --socket=/tmp/sqmate_temp_\$\$.sock \\"
         echo "     --datadir=\"${SQL_DIR}/data\" &"
         echo ""
         echo "   # Connect and fix authentication"
-        echo "   $sql_client -u root --socket=/tmp/temp.sock"
+        echo "   $sql_client -u root --socket=/tmp/sqmate_temp_\$\$.sock"
         echo "   # In MariaDB, run:"
         echo "   #   FLUSH PRIVILEGES;"
         echo "   #   ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('');"
