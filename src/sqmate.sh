@@ -39,6 +39,11 @@ mkdir -p "${CONFIG_DIR}" 2> /dev/null || {
     exit 1
 }
 
+cleanup_on_exit() {
+    cleanup_pid_files "$PROFILE" 2>/dev/null || true
+}
+trap 'cleanup_on_exit; exit 1' INT TERM
+
 # --- Core Functions ---
 
 # Function: logs a message to a file and outputs it to the console.
@@ -195,7 +200,7 @@ EOF
 
 # Function: display usage information.
 usage() {
-    cat << EOF
+    cat << 'EOF'
 
 SQMATE - Universal SQL Server Manager
 
@@ -212,8 +217,8 @@ Commands:
     connect     Connect to SQL server
     logs        Show recent error logs
     reset-auth  Reset MariaDB/MySQL root authentication (fixes login issues)
-    help        Display this help information
     version     Show version information
+    help        Display this help information
 
 Options:
     --sql-dir=<path>     Set MySQL/MariaDB installation directory
@@ -250,7 +255,6 @@ Supported Databases:
 Environment Variables:
     SQMATE_CONFIG_DIR   Override default config directory (~/.config/sqmate)
     LOG_LEVEL            Set logging verbosity (DEBUG, INFO, WARNING, ERROR)
-
 EOF
 }
 
@@ -430,8 +434,16 @@ parse_hostport() {
     log_message "DEBUG" "Parsing hostport: $hostport_arg"
 
     # Parse input based on format
-    if [[ "$hostport_arg" =~ ^([^:]+):([0-9]+)$ ]]; then
-        # Format: host:port
+    if [[ "$hostport_arg" =~ ^(\[[0-9a-fA-F:]+\]):([0-9]+)$ ]]; then
+        # Format: [IPv6]:port
+        local parsed_host="${BASH_REMATCH[1]}"
+        local parsed_port="${BASH_REMATCH[2]}"
+        validate_hostname "$parsed_host" || return 1
+        validate_port "$parsed_port" || return 1
+        SQL_HOST="$parsed_host"
+        SQL_PORT="$parsed_port"
+    elif [[ "$hostport_arg" =~ ^([^:]+):([0-9]+)$ ]]; then
+        # Format: host:port (IPv4 or hostname)
         local parsed_host="${BASH_REMATCH[1]}"
         local parsed_port="${BASH_REMATCH[2]}"
         validate_hostname "$parsed_host" || return 1
@@ -452,6 +464,10 @@ parse_hostport() {
         # Format: just port number
         validate_port "$hostport_arg" || return 1
         SQL_PORT="$hostport_arg"
+    elif [[ "$hostport_arg" =~ .*:.* ]]; then
+        # Contains colons but doesn't match IPv6 format - warn user
+        log_message "ERROR" "IPv6 addresses must be in [host]:port format, e.g., [::1]:3306"
+        return 1
     else
         # Invalid format
         log_message "WARNING" "Could not parse '$hostport_arg' as host:port. Using defaults: $SQL_HOST:$SQL_PORT"
@@ -459,11 +475,9 @@ parse_hostport() {
 
     # Update socket file with new profile/port
     SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
-    SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}_${SQL_PORT}.server.pid"
 
     # Log result
     log_message "DEBUG" "Parsed host:port as HOST=$SQL_HOST, PORT=$SQL_PORT"
-
     return 0
 }
 
@@ -1376,6 +1390,47 @@ show_logs() {
 
 # --- Main Script Execution ---
 
+# Function: guard against missing external tools
+check_required_tools() {
+    local missing_tools=()
+    
+    # Core required tools
+    local required_tools=("ps" "kill" "realpath")
+    
+    # Optional tools (with descriptions of what they're used for)
+    local optional_tools=("ss" "lsof")
+    
+    for tool in "${required_tools[@]}"; do
+        if ! command -v "$tool" > /dev/null 2>&1; then
+            missing_tools+=("$tool")
+        fi
+    done
+    
+    if [[ ${#missing_tools[@]} -gt 0 ]]; then
+        log_message "ERROR" "Missing required tools: ${missing_tools[*]}"
+        log_message "ERROR" "Please install these tools and try again"
+        return 1
+    fi
+    
+    # Check optional tools and warn about missing functionality
+    local missing_optional=()
+    for tool in "${optional_tools[@]}"; do
+        if ! command -v "$tool" > /dev/null 2>&1; then
+            missing_optional+=("$tool")
+        fi
+    done
+    
+    # Warn about specific missing optional tools
+    if [[ ${#missing_optional[@]} -eq ${#optional_tools[@]} ]]; then
+        # All optional tools are missing
+        log_message "WARNING" "Optional tools missing: ${missing_optional[*]}. Port availability checking disabled."
+    elif [[ ${#missing_optional[@]} -gt 0 ]]; then
+        # Some optional tools are missing
+        log_message "DEBUG" "Optional tools not found: ${missing_optional[*]}"
+    fi
+    
+    return 0
+}
 # Function: main entry point
 main() {
     # Extract command and shift arguments
@@ -1384,6 +1439,11 @@ main() {
 
     # Load default configuration
     load_config || return $?
+
+    # Check required tools (except for help/version commands)
+    if [[ "$command" != "help" && "$command" != "version" && "$command" != "--help" && "$command" != "-h" ]]; then
+        check_required_tools || return $?
+    fi
 
     # Process command-line options
     parse_options "$@" || return $?
