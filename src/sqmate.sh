@@ -1,499 +1,230 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# ==============================================================================
+# sqmate — Universal SQL Server Manager
+# ==============================================================================
 #
-# SQMATE - Universal SQL Server Manager
-# A lightweight tool to manage MySQL and MariaDB portable installations for local development.
+# Manages portable MySQL and MariaDB installations for local development.
+# Supports multiple concurrent profiles (each with its own port, socket, and
+# config), auto-detects engine type, and handles process lifecycle safely.
 #
-# Copyright (C) 2025, Daniel Zilli. All rights reserved.
+# Usage:
+#   sqmate <command> [options] [<host>:<port>]
 #
+# Commands:
+#   init        Initialise data directory and save installation path
+#   start       Start the SQL server          (default: localhost:3306)
+#   stop        Stop the running server
+#   restart     Restart the server
+#   status      Show server status
+#   logs        Tail the engine error log
+#   reset-auth  Reset root authentication (fixes broken-login situations)
+#   version     Print version information
+#   help        Print this help text
+#
+# Options:
+#   --sql-dir=<path>   Path to the MySQL/MariaDB installation directory
+#   --profile=<name>   Named configuration profile (default: "default")
+#   --host=<addr>      Bind address              (default: localhost)
+#   --port=<n>         TCP port                  (default: 3306)
+#
+# Examples:
+#   sqmate init --sql-dir=/opt/mariadb-11.4
+#   sqmate start
+#   sqmate start --port=3307 --profile=mariadb11
+#   sqmate start --profile=mysql8 --port=3308
+#   sqmate stop   --profile=mysql8
+#
+# Profile workflow (two engines side-by-side):
+#   sqmate init  --profile=mysql8    --sql-dir=/opt/mysql-8.0.39
+#   sqmate start --profile=mysql8    --port=3306
+#   sqmate init  --profile=mariadb11 --sql-dir=/opt/mariadb-11.4
+#   sqmate start --profile=mariadb11 --port=3307
+#
+# Environment:
+#   SQMATE_CONFIG_DIR   Override config directory (default: ~/.config/sqmate)
+#
+# Supported engines:
+#   MySQL   5.7, 8.0, 8.1+
+#   MariaDB 10.3, 10.4, 10.5, 10.6, 10.11, 11.x+
+#
+# Author:  Daniel Zilli
+# Version: 1.2.0
+# License: Copyright (C) 2025 Daniel Zilli. All rights reserved.
+# ==============================================================================
 
-# Exit on error, undefined vars, and error in pipes.
+# Abort on unset variables, unhandled errors, and pipeline failures.
 set -euo pipefail
 
-# --- Default Configuration & Constants ---
+# ==============================================================================
+# CONSTANTS & DEFAULTS
+# ==============================================================================
 
+readonly VERSION="1.2.0"
+
+# Runtime state — may be overridden by load_config / parse_options.
 SQL_HOST="localhost"
 SQL_PORT="3306"
 SQL_DIR=""
-SQL_ENGINE=""  # mysql or mariadb (auto-detected)
-VERSION="1.0.1"
+SQL_ENGINE=""   # "mysql" or "mariadb"; populated by detect_sql_engine
+SQL_BIN=""      # Absolute path to mysqld / mariadbd binary
+
 PROFILE="default"
 CONFIG_DIR="${SQMATE_CONFIG_DIR:-${HOME}/.config/sqmate}"
+
+# File paths are re-derived whenever PROFILE or SQL_PORT change.
 CONFIG_FILE="${CONFIG_DIR}/config_${PROFILE}"
 PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.pid"
 SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}_${SQL_PORT}.server.pid"
 LOGFILE="${CONFIG_DIR}/sqmate_${PROFILE}.log"
 SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
-SQL_BIN=""
 
-declare -A LOG_LEVELS=([DEBUG]=0 [INFO]=1 [WARNING]=2 [ERROR]=3)
-: "${LOG_LEVEL:=INFO}" # Default log level
+# ANSI colours — defined once, referenced by log_message.
+declare -r COLOR_INFO='\033[0;34m'
+declare -r COLOR_SUCCESS='\033[0;32m'
+declare -r COLOR_WARNING='\033[0;33m'
+declare -r COLOR_ERROR='\033[0;31m'
+declare -r COLOR_RESET='\033[0m'
 
-declare -r COLOR_INFO='\033[0;34m'    # Blue
-declare -r COLOR_SUCCESS='\033[0;32m' # Green
-declare -r COLOR_WARNING='\033[0;33m' # Yellow
-declare -r COLOR_ERROR='\033[0;31m'   # Red
-declare -r COLOR_RESET='\033[0m'      # Reset color
-
-mkdir -p "${CONFIG_DIR}" 2> /dev/null || {
-    printf "[ERROR] Failed to create configuration directory: %s\n" "${CONFIG_DIR}" >&2
+# Ensure the config directory exists before any log_message call writes to it.
+mkdir -p "${CONFIG_DIR}" 2>/dev/null || {
+    printf "[ERROR] Cannot create config directory: %s\n" "${CONFIG_DIR}" >&2
     exit 1
 }
 
-cleanup_on_exit() {
-    cleanup_pid_files "$PROFILE" 2>/dev/null || true
-}
-trap 'cleanup_on_exit; exit 1' INT TERM
+# ==============================================================================
+# OUTPUT HELPERS
+# ==============================================================================
 
-# --- Core Functions ---
-
-# Function: logs a message to a file and outputs it to the console.
+# log_message — write a levelled message to the log file and to the terminal.
+#
+#   $1  level    — INFO | SUCCESS | WARNING | ERROR
+#   $2  message  — human-readable text
 log_message() {
-    # Input parameters
     local level="$1"
     local message="$2"
 
-    # Validate log level
-    local current_level_val="${LOG_LEVELS[${level^^}]:-${LOG_LEVELS[ERROR]}}"
-    local configured_level_val="${LOG_LEVELS[${LOG_LEVEL^^}]:-${LOG_LEVELS[INFO]}}"
-    if [[ "$current_level_val" -lt "$configured_level_val" ]]; then
-        return 0
-    fi
-
-    # Prepare metadata
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S' 2> /dev/null) || timestamp="UNKNOWN_TIME"
-    local pid=$$
-
-    # Format message for console output
-    local formatted
     case "${level^^}" in
-        INFO) formatted=$(printf "%s[INFO]%s %s" "$COLOR_INFO" "$COLOR_RESET" "$message") ;;
-        SUCCESS) formatted=$(printf "%s[SUCCESS]%s %s" "$COLOR_SUCCESS" "$COLOR_RESET" "$message") ;;
-        WARNING) formatted=$(printf "%s[WARNING]%s %s" "$COLOR_WARNING" "$COLOR_RESET" "$message") ;;
-        ERROR) formatted=$(printf "%s[ERROR]%s %s" "$COLOR_ERROR" "$COLOR_RESET" "$message") ;;
-        DEBUG) formatted=$(printf "[DEBUG] %s" "$message") ;;
-        *) formatted=$(printf "%s" "$message") ;;
+        INFO)    printf "%b[INFO]%b    %s\n" "$COLOR_INFO"    "$COLOR_RESET" "$message" ;;
+        SUCCESS) printf "%b[SUCCESS]%b %s\n" "$COLOR_SUCCESS" "$COLOR_RESET" "$message" ;;
+        WARNING) printf "%b[WARNING]%b %s\n" "$COLOR_WARNING" "$COLOR_RESET" "$message" >&2 ;;
+        ERROR)   printf "%b[ERROR]%b   %s\n" "$COLOR_ERROR"   "$COLOR_RESET" "$message" >&2 ;;
+        *)       printf "%s\n" "$message" ; return 0 ;; # Exit early for unknown/debug levels
     esac
 
-    # Write to log file
-    printf "[%s] [%s] [PID:%d] %s\n" "$timestamp" "${level^^}" "$pid" "$message" >> "$LOGFILE" 2> /dev/null || {
-        printf "[%s] [WARNING] [PID:%d] Failed to write to log file: %s\n" "$timestamp" "$pid" "$LOGFILE" >&2
-    }
-
-    # Output to console
-    local output_stream=1
-    [[ "${level^^}" == "ERROR" || "${level^^}" == "WARNING" ]] && output_stream=2
-    if [[ -t "$output_stream" ]]; then
-        echo -e "$formatted" >&"$output_stream"
-    else
-        echo -e "$formatted" | sed 's/\x1b\[[0-9;]*m//g' >&"$output_stream"
+    # Append to log file using Bash 4.2+ native time formatting (no subshell forks)
+    if [[ -n "${LOGFILE:-}" ]]; then
+        printf "[%(%Y-%m-%d %H:%M:%S)T] [%-7s] [PID:%d] %s\n" "-1" "${level^^}" "$$" "$message" >> "$LOGFILE" 2>/dev/null || true
     fi
 }
 
-# Function: manages PID file operations.
-manage_pidfile() {
-    # Input parameters
-    local action="$1"
-    local extra_data="${2:-}"
-
-    case "$action" in
-        create)
-            # Resolve absolute paths
-            local abs_sql_dir
-            abs_sql_dir=$(realpath -m "$SQL_DIR" 2> /dev/null) || abs_sql_dir="$SQL_DIR"
-            local abs_data_dir="${abs_sql_dir}/data"
-
-            # Create PID file with server info
-            if ! cat > "$PIDFILE" << EOF; then
-SQL_HOST=$SQL_HOST
-SQL_PORT=$SQL_PORT
-SQL_DIR=$abs_sql_dir
-SQL_ENGINE=$SQL_ENGINE
-DATA_DIR=$abs_data_dir
-SOCKET_FILE=$SOCKET_FILE
-PID=$extra_data
-PROFILE=$PROFILE
-EOF
-                log_message "ERROR" "Failed to write PID file: $PIDFILE"
-                return 1
-            fi
-
-            # Set file permissions
-            chmod 600 "$PIDFILE" 2> /dev/null || log_message "WARNING" "Failed to set permissions on PID file: $PIDFILE"
-            return 0
-            ;;
-
-        read)
-            # Check if PID file exists
-            if [ ! -e "$PIDFILE" ]; then
-                return 1
-            fi
-
-            # Read and validate PID file content
-            local content
-            content=$(cat "$PIDFILE")
-            if ! echo "$content" | grep -qE '^(SQL_HOST|SQL_PORT|SQL_DIR|SQL_ENGINE|DATA_DIR|SOCKET_FILE|PID|PROFILE)=' \
-                || ! echo "$content" | grep -q '^PID=' \
-                || ! echo "$content" | grep -q '^SQL_HOST=' \
-                || ! echo "$content" | grep -q '^SQL_PORT='; then
-                log_message "ERROR" "PID file has invalid format: $PIDFILE"
-                rm -f "$PIDFILE" 2> /dev/null && log_message "INFO" "Removed invalid PID file: $PIDFILE"
-                return 1
-            fi
-
-            # Output valid content
-            echo "$content"
-            return 0
-            ;;
-
-        get_value)
-            # Extract specific value from PID file
-            local pid_data
-            pid_data=$(manage_pidfile read) || return 1
-            echo "$pid_data" | grep "^${extra_data}=" | cut -d'=' -f2
-            return 0
-            ;;
-
-        check)
-            # Read PID file
-            local pid_data server_pid
-            pid_data=$(manage_pidfile read) || return 1
-            server_pid=$(echo "$pid_data" | grep '^PID=' | cut -d'=' -f2)
-
-            # Validate PID
-            if [ -z "$server_pid" ] || ! [[ "$server_pid" =~ ^[0-9]+$ ]]; then
-                log_message "WARNING" "Invalid PID in $PIDFILE"
-                rm -f "$PIDFILE" 2> /dev/null && log_message "INFO" "Removed invalid PID file: $PIDFILE"
-                return 1
-            fi
-
-            # Check if process exists
-            if ! kill -0 "$server_pid" 2> /dev/null; then
-                log_message "WARNING" "SQL server process (PID: $server_pid) not found."
-                rm -f "$PIDFILE" 2> /dev/null && log_message "INFO" "Removed stale PID file: $PIDFILE"
-                return 1
-            fi
-
-            # Validate port binding if lsof is available
-            if command -v lsof > /dev/null 2>&1; then
-                local port
-                port=$(echo "$pid_data" | grep '^SQL_PORT=' | cut -d'=' -f2)
-                if ! lsof -i :"$port" -sTCP:LISTEN -t 2> /dev/null | grep -q "^$server_pid$"; then
-                    log_message "WARNING" "PID $server_pid does not match process on port $port."
-                    rm -f "$PIDFILE" 2> /dev/null && log_message "INFO" "Removed invalid PID file: $PIDFILE"
-                    return 1
-                fi
-            fi
-            return 0
-            ;;
-
-        cleanup)
-            # Remove PID file
-            cleanup_pid_files "$PROFILE"
-            return 0
-            ;;
-    esac
-
-    # Invalid action
-    return 1
-}
-
-# Function: display usage information.
+# usage — print the full help text to stdout.
 usage() {
-    cat << 'EOF'
+    cat <<'EOF'
 
-SQMATE - Universal SQL Server Manager
+sqmate — Universal SQL Server Manager
 
 Usage:
-    sqmate <command> [options] [<hostname>:<port>]
+    sqmate <command> [options] [<host>:<port>]
 
 Commands:
-    init        Initialize SQL data directory and set installation path
-    start       Start the SQL server (default: localhost:3306)
+    init        Initialise data directory and save installation path
+    start       Start the SQL server          (default: localhost:3306)
     stop        Stop the running server
     restart     Restart the server
-    status      Show server status
-    config      Show current configuration
-    connect     Connect to SQL server
-    logs        Show recent error logs
-    reset-auth  Reset MariaDB/MySQL root authentication (fixes login issues)
-    version     Show version information
-    help        Display this help information
+    status      Show live server status (PID, socket, uptime)
+    logs        Tail the engine error log
+    reset-auth  Reset root authentication (fixes broken-login situations)
+    version     Print version information
+    help        Print this help text
 
 Options:
-    --sql-dir=<path>     Set MySQL/MariaDB installation directory
-    --profile=<name>     Use specific configuration profile
-    --host=<hostname>    Set SQL hostname (default: localhost)
-    --port=<number>      Set SQL port (default: 3306)
-    --debug              Enable debug logging (sets LOG_LEVEL=DEBUG)
+    --sql-dir=<path>   Path to the MySQL/MariaDB installation directory
+    --profile=<name>   Named configuration profile (default: "default")
+    --host=<addr>      Bind address              (default: localhost)
+    --port=<n>         TCP port                  (default: 3306)
 
 Examples:
-    sqmate init
+    sqmate init --sql-dir=/opt/mariadb-11.4
     sqmate start
-    sqmate start --host=0.0.0.0 --port=3307
-    sqmate start --profile=mysql8
-    sqmate start --profile=mariadb11
-    sqmate config --profile=production
-    sqmate connect
-    sqmate stop
+    sqmate start --port=3307 --profile=mariadb11
+    sqmate stop   --profile=mysql8
 
-Profile Creation:
-    Profiles are created automatically when you use --profile=<name> for the first time.
-    Each profile maintains its own configuration, PID file, and can run simultaneously
-    on different ports.
-
-    Example workflow:
-    sqmate init --profile=mysql8 --sql-dir=/opt/mysql-8.0.39
-    sqmate start --profile=mysql8 --port=3306
-    sqmate init --profile=mariadb11 --sql-dir=/opt/mariadb-10.11.5
+Profile workflow (two engines side-by-side):
+    sqmate init  --profile=mysql8    --sql-dir=/opt/mysql-8.0.39
+    sqmate start --profile=mysql8    --port=3306
+    sqmate init  --profile=mariadb11 --sql-dir=/opt/mariadb-11.4
     sqmate start --profile=mariadb11 --port=3307
 
-Supported Databases:
-    - MySQL 5.7, 8.0, 8.1+ (auto-detected)
-    - MariaDB 10.3, 10.4, 10.5, 10.6, 10.11, 11.x+ (auto-detected)
+Environment:
+    SQMATE_CONFIG_DIR   Override config directory (default: ~/.config/sqmate)
 
-Environment Variables:
-    SQMATE_CONFIG_DIR   Override default config directory (~/.config/sqmate)
-    LOG_LEVEL            Set logging verbosity (DEBUG, INFO, WARNING, ERROR)
+Supported engines:
+    MySQL   5.7, 8.0, 8.1+
+    MariaDB 10.3, 10.4, 10.5, 10.6, 10.11, 11.x+
+
 EOF
 }
 
-# Function: display version information.
+# show_version — print engine/version banner.
 show_version() {
-    echo "SQMATE - Universal SQL Server Manager"
-    echo "Version: ${VERSION}"
-    echo "Supports: MySQL and MariaDB portable installations"
+    printf "sqmate — Universal SQL Server Manager\n"
+    printf "Version : %s\n" "$VERSION"
+    printf "Engines : MySQL and MariaDB portable installations\n"
 }
 
-# --- Validation Functions ---
+# ==============================================================================
+# FLAGS & OPTION PARSING
+# ==============================================================================
 
-# Function: validates if a file or directory exists.
-validate_path() {
-    # Input parameters
-    local path="$1"
-    local type="$2" # "file" or "dir"
-    local description="$3"
-
-    # Check for empty path
-    [[ -z "$path" ]] && return 0
-
-    # Validate path based on type
-    if [[ "$type" == "file" && ! -f "$path" ]]; then
-        log_message "ERROR" "$description '$path' not found."
-        return 1
-    elif [[ "$type" == "dir" && ! -d "$path" ]]; then
-        log_message "ERROR" "$description '$path' not found."
-        return 1
-    fi
-
-    # Path is valid
-    return 0
-}
-
-# Function: validates hostname format.
-validate_hostname() {
-    # Input parameter
-    local hostname="$1"
-
-    # Validate hostname format
-    if [[ "$hostname" =~ ^[a-zA-Z0-9.-]+$ || "$hostname" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ || "$hostname" =~ ^\[[0-9a-fA-F:]+\]$ ]]; then
-        return 0
-    fi
-
-    # Log error for invalid hostname
-    log_message "ERROR" "Invalid hostname: $hostname"
-    return 1
-}
-
-# Function: validates port number.
-validate_port() {
-    # Input parameter
-    local port="$1"
-
-    # Validate port number
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        log_message "ERROR" "Invalid port number: $port"
-        return 1
-    fi
-
-    # Port is valid
-    return 0
-}
-
-# Function: detects SQL engine type (MySQL or MariaDB).
-detect_sql_engine() {
-    # Input parameter
-    local sql_dir="${SQL_DIR}"
-    local mysqld_path="${sql_dir}/bin/mysqld"
-    local mariadbd_path="${sql_dir}/bin/mariadbd"
-    
-    log_message "DEBUG" "Detecting SQL engine type in: $sql_dir"
-
-    # Check for MariaDB first (prefer mariadbd over mysqld)
-    if [ -f "$mariadbd_path" ]; then
-        SQL_ENGINE="mariadb"
-        SQL_BIN="$mariadbd_path"
-        log_message "DEBUG" "Found mariadbd binary, detected MariaDB engine"
-        return 0
-    elif [ -f "$mysqld_path" ]; then
-        # Try to get version information to distinguish between MySQL and MariaDB
-        local version_output
-        version_output=$("$mysqld_path" --version 2>/dev/null) || {
-            log_message "ERROR" "Failed to get version from mysqld binary"
-            return 1
-        }
-
-        log_message "DEBUG" "Version output: $version_output"
-
-        # Detect based on version string
-        if echo "$version_output" | grep -qi "mariadb"; then
-            SQL_ENGINE="mariadb"
-            SQL_BIN="$mysqld_path"
-            log_message "DEBUG" "Detected MariaDB engine (using mysqld binary)"
-        elif echo "$version_output" | grep -qi "mysql"; then
-            SQL_ENGINE="mysql"
-            SQL_BIN="$mysqld_path"
-            log_message "DEBUG" "Detected MySQL engine"
-        else
-            log_message "WARNING" "Unable to detect SQL engine type, assuming MySQL"
-            SQL_ENGINE="mysql"
-            SQL_BIN="$mysqld_path"
-        fi
-    else
-        log_message "ERROR" "Neither mysqld nor mariadbd binary found in: $sql_dir/bin/"
-        return 1
-    fi
-
-    return 0
-}
-
-# Function: validates SQL installation.
-validate_sql() {
-    # Input parameter
-    local sql_dir="${SQL_DIR}"
-    log_message "DEBUG" "Validating SQL installation: $sql_dir"
-
-    # Check if SQL directory is set
-    if [ -z "$sql_dir" ]; then
-        log_message "ERROR" "SQL directory not configured. Run 'sqmate init' first."
-        return 1
-    fi
-
-    # Validate SQL directory exists
-    if ! validate_path "$sql_dir" "dir" "SQL directory"; then
-        return 1
-    fi
-
-    # Detect engine type
-    detect_sql_engine || return 1
-
-    # Check if binary is executable
-    if [ ! -x "$SQL_BIN" ]; then
-        log_message "ERROR" "SQL server binary is not executable: $SQL_BIN"
-        return 1
-    fi
-
-    # SQL installation is valid
-    return 0
-}
-
-# Function: checks if a port is available on a host.
-check_port_available() {
-    # Input parameters
-    local host="$1"
-    local port="$2"
-    log_message "DEBUG" "Checking port $port availability on host $host"
-
-    # Check port using ss (preferred)
-    if command -v ss > /dev/null 2>&1; then
-        if ss -tuln | grep -qE "($host|0.0.0.0|\[::\]):$port\s"; then
-            log_message "ERROR" "Port $host:$port is in use."
-            return 1
-        fi
-    # Fallback to lsof
-    elif command -v lsof > /dev/null 2>&1; then
-        if lsof -i :"$port" -sTCP:LISTEN > /dev/null 2>&1; then
-            log_message "ERROR" "Port $host:$port is in use."
-            return 1
-        fi
-    # No tools available
-    else
-        log_message "WARNING" "No port checking tool (ss or lsof) available. Cannot verify if port $host:$port is free."
-    fi
-
-    # Port is available
-    return 0
-}
-
-# --- Configuration Management ---
-
-# Function: parses hostname:port from argument.
+# parse_hostport — parse an optional positional "<host>:<port>" argument.
+#
+#   $1  hostport  — one of:  host:port | :port | host | port | [IPv6]:port
+#
+# Updates the global SQL_HOST / SQL_PORT variables and re-derives SOCKET_FILE.
 parse_hostport() {
-    # Input parameter
     local hostport_arg="$1"
-    log_message "DEBUG" "Parsing hostport: $hostport_arg"
 
-    # Parse input based on format
     if [[ "$hostport_arg" =~ ^(\[[0-9a-fA-F:]+\]):([0-9]+)$ ]]; then
-        # Format: [IPv6]:port
-        local parsed_host="${BASH_REMATCH[1]}"
-        local parsed_port="${BASH_REMATCH[2]}"
-        validate_hostname "$parsed_host" || return 1
-        validate_port "$parsed_port" || return 1
-        SQL_HOST="$parsed_host"
-        SQL_PORT="$parsed_port"
+        validate_hostname "${BASH_REMATCH[1]}" || return 1
+        validate_port     "${BASH_REMATCH[2]}" || return 1
+        SQL_HOST="${BASH_REMATCH[1]}"
+        SQL_PORT="${BASH_REMATCH[2]}"
     elif [[ "$hostport_arg" =~ ^([^:]+):([0-9]+)$ ]]; then
-        # Format: host:port (IPv4 or hostname)
-        local parsed_host="${BASH_REMATCH[1]}"
-        local parsed_port="${BASH_REMATCH[2]}"
-        validate_hostname "$parsed_host" || return 1
-        validate_port "$parsed_port" || return 1
-        SQL_HOST="$parsed_host"
-        SQL_PORT="$parsed_port"
+        validate_hostname "${BASH_REMATCH[1]}" || return 1
+        validate_port     "${BASH_REMATCH[2]}" || return 1
+        SQL_HOST="${BASH_REMATCH[1]}"
+        SQL_PORT="${BASH_REMATCH[2]}"
     elif [[ "$hostport_arg" =~ ^:([0-9]+)$ ]]; then
-        # Format: :port
-        local parsed_port="${BASH_REMATCH[1]}"
-        validate_port "$parsed_port" || return 1
-        SQL_PORT="$parsed_port"
+        validate_port "${BASH_REMATCH[1]}" || return 1
+        SQL_PORT="${BASH_REMATCH[1]}"
     elif [[ "$hostport_arg" =~ ^([^:]+):?$ ]]; then
-        # Format: host: or just host
-        local parsed_host="${BASH_REMATCH[1]}"
-        validate_hostname "$parsed_host" || return 1
-        SQL_HOST="$parsed_host"
+        validate_hostname "${BASH_REMATCH[1]}" || return 1
+        SQL_HOST="${BASH_REMATCH[1]}"
     elif [[ "$hostport_arg" =~ ^[0-9]+$ ]]; then
-        # Format: just port number
         validate_port "$hostport_arg" || return 1
         SQL_PORT="$hostport_arg"
     elif [[ "$hostport_arg" =~ .*:.* ]]; then
-        # Contains colons but doesn't match IPv6 format - warn user
-        log_message "ERROR" "IPv6 addresses must be in [host]:port format, e.g., [::1]:3306"
+        log_message "ERROR" "IPv6 addresses must use bracket notation: [::1]:3306"
         return 1
     else
-        # Invalid format
-        log_message "WARNING" "Could not parse '$hostport_arg' as host:port. Using defaults: $SQL_HOST:$SQL_PORT"
+        log_message "WARNING" "Cannot parse '$hostport_arg' as host:port — using defaults ($SQL_HOST:$SQL_PORT)"
     fi
 
-    # Update socket file with new profile/port
+    # Re-derive the socket path now that port is resolved.
     SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
-
-    # Log result
-    log_message "DEBUG" "Parsed host:port as HOST=$SQL_HOST, PORT=$SQL_PORT"
-    return 0
 }
 
-# Function: parses command line options.
+# parse_options — process all named options and the optional positional argument.
 parse_options() {
-    # Initialize variables
-    local arg params=()
+    local arg
+    local -a positional=()
 
-    # Process command line options
-    while [ "$#" -gt 0 ]; do
+    while [[ "$#" -gt 0 ]]; do
         arg="$1"
         case "$arg" in
             --sql-dir=*)
                 SQL_DIR="${arg#*=}"
                 validate_path "$SQL_DIR" "dir" "SQL directory" || return 1
-                shift
                 ;;
             --profile=*)
                 PROFILE="${arg#*=}"
@@ -502,23 +233,16 @@ parse_options() {
                 SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}_${SQL_PORT}.server.pid"
                 LOGFILE="${CONFIG_DIR}/sqmate_${PROFILE}.log"
                 SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
-                shift
                 ;;
             --host=*)
                 SQL_HOST="${arg#*=}"
                 validate_hostname "$SQL_HOST" || return 1
-                shift
                 ;;
             --port=*)
                 SQL_PORT="${arg#*=}"
                 validate_port "$SQL_PORT" || return 1
                 SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
                 SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}_${SQL_PORT}.server.pid"
-                shift
-                ;;
-            --debug)
-                LOG_LEVEL="DEBUG"
-                shift
                 ;;
             -*)
                 log_message "ERROR" "Unknown option: $arg"
@@ -526,978 +250,877 @@ parse_options() {
                 return 2
                 ;;
             *)
-                params+=("$arg")
-                shift
+                positional+=("$arg")
                 ;;
         esac
+        shift
     done
 
-    # Process positional arguments (hostname:port)
-    if [[ "${#params[@]}" -gt 0 ]]; then
-        parse_hostport "${params[0]}" || return 1
+    if [[ "${#positional[@]}" -gt 0 ]]; then
+        parse_hostport "${positional[0]}" || return 1
     fi
-
-    # Options parsed successfully
-    return 0
 }
 
-# Function: loads configuration from file.
-load_config() {
-    # Initialize configuration file path
-    local config_file="${CONFIG_DIR}/config_${PROFILE:-default}"
-    log_message "DEBUG" "Loading configuration from: $config_file"
+# ==============================================================================
+# PATH RESOLUTION & VALIDATION
+# ==============================================================================
 
-    # Ensure config directory exists
-    mkdir -p "$CONFIG_DIR" 2> /dev/null || {
-        log_message "ERROR" "Failed to create config directory: $CONFIG_DIR"
+# validate_path — assert that a filesystem path exists and is the expected type.
+validate_path() {
+    local path="$1" type="$2" description="$3"
+
+    [[ -z "$path" ]] && return 0
+
+    if [[ "$type" == "file" && ! -f "$path" ]]; then
+        log_message "ERROR" "$description not found: '$path'"
         return 1
-    }
-    chmod 700 "$CONFIG_DIR" 2> /dev/null || log_message "WARNING" "Failed to set permissions on config directory"
+    elif [[ "$type" == "dir" && ! -d "$path" ]]; then
+        log_message "ERROR" "$description not found: '$path'"
+        return 1
+    fi
+}
 
-    # Load configuration if file exists
-    if [ -f "$config_file" ]; then
-        # Set file permissions
-        chmod 600 "$config_file" 2> /dev/null || log_message "WARNING" "Failed to set permissions on config file"
+# validate_hostname — reject strings that cannot be valid hostnames or IP addresses.
+validate_hostname() {
+    local hostname="$1"
+    if [[ "$hostname" =~ ^[a-zA-Z0-9.-]+$               # hostname / IPv4
+       || "$hostname" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$  # strict IPv4 (extra check)
+       || "$hostname" =~ ^\[[0-9a-fA-F:]+\]$             # [IPv6]
+    ]]; then
+        return 0
+    fi
+    log_message "ERROR" "Invalid hostname: '$hostname'"
+    return 1
+}
 
-        # Validate config file syntax
-        if ! bash -n "$config_file" 2> /dev/null; then
-            log_message "ERROR" "Invalid syntax in configuration file: $config_file"
-            return 1
-        fi
+# validate_port — ensure a port number is a plain integer in [1, 65535].
+validate_port() {
+    local port="$1"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+        log_message "ERROR" "Invalid port number: '$port' (must be 1–65535)"
+        return 1
+    fi
+}
 
-        # Source the configuration
-        # shellcheck source=/dev/null
-        if ! source "$config_file"; then
-            log_message "ERROR" "Failed to load configuration from: $config_file"
-            return 1
-        fi
-        log_message "DEBUG" "Loaded configuration from file"
-    else
-        log_message "DEBUG" "No configuration file found, using defaults."
+# detect_sql_engine — inspect SQL_DIR to determine whether it is a MySQL or MariaDB installation
+detect_sql_engine() {
+    local mariadbd="${SQL_DIR}/bin/mariadbd"
+    local mysqld="${SQL_DIR}/bin/mysqld"
+
+    if [[ -f "$mariadbd" ]]; then
+        SQL_ENGINE="mariadb"
+        SQL_BIN="$mariadbd"
+        return 0
     fi
 
-    # Update global config file variable
-    CONFIG_FILE="$config_file"
+    if [[ ! -f "$mysqld" ]]; then
+        log_message "ERROR" "No mysqld or mariadbd binary found in: ${SQL_DIR}/bin/"
+        return 1
+    fi
 
-    # Update dependent variables
+    local ver
+    ver=$("$mysqld" --version 2>/dev/null) || {
+        log_message "ERROR" "Failed to query version from: $mysqld"
+        return 1
+    }
+
+    if echo "$ver" | grep -qi "mariadb"; then
+        SQL_ENGINE="mariadb"
+    elif echo "$ver" | grep -qi "mysql"; then
+        SQL_ENGINE="mysql"
+    else
+        log_message "WARNING" "Engine type ambiguous; defaulting to mysql"
+        SQL_ENGINE="mysql"
+    fi
+
+    SQL_BIN="$mysqld"
+}
+
+# validate_sql — confirm that SQL_DIR is set, exists, and contains an executable binary.
+validate_sql() {
+    if [[ -z "$SQL_DIR" ]]; then
+        log_message "ERROR" "SQL directory not configured. Run 'sqmate init' first."
+        return 1
+    fi
+
+    validate_path "$SQL_DIR" "dir" "SQL directory" || return 1
+    detect_sql_engine || return 1
+
+    if [[ ! -x "$SQL_BIN" ]]; then
+        log_message "ERROR" "SQL binary is not executable: $SQL_BIN"
+        return 1
+    fi
+}
+
+# check_port_available — return non-zero if something is already bound to the given port.
+check_port_available() {
+    local host="$1" port="$2"
+
+    if command -v ss &>/dev/null; then
+        if ss -tuln | grep -qE "(${host}|0\.0\.0\.0|\[::\]):${port}[[:space:]]"; then
+            log_message "ERROR" "Port ${host}:${port} is already in use."
+            return 1
+        fi
+    elif command -v lsof &>/dev/null; then
+        if lsof -i :"$port" -sTCP:LISTEN &>/dev/null; then
+            log_message "ERROR" "Port ${host}:${port} is already in use."
+            return 1
+        fi
+    else
+        log_message "WARNING" "Neither 'ss' nor 'lsof' found; cannot pre-check port ${host}:${port}."
+    fi
+}
+
+# check_required_tools — abort early if a core POSIX utility is missing.
+check_required_tools() {
+    local -a missing=()
+    local tool
+
+    for tool in ps kill realpath; do
+        command -v "$tool" &>/dev/null || missing+=("$tool")
+    done
+
+    if (( ${#missing[@]} > 0 )); then
+        log_message "ERROR" "Missing required tools: ${missing[*]}"
+        return 1
+    fi
+
+    if ! command -v ss &>/dev/null && ! command -v lsof &>/dev/null; then
+        log_message "WARNING" "Optional tools 'ss' and 'lsof' not found — port conflict checking disabled."
+    fi
+}
+
+# ==============================================================================
+# STATE PERSISTENCE  (config files + PID files)
+# ==============================================================================
+
+# load_config — source the profile config file if it exists.
+load_config() {
+    local cfg="${CONFIG_DIR}/config_${PROFILE:-default}"
+
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || {
+        log_message "ERROR" "Cannot create config directory: $CONFIG_DIR"
+        return 1
+    }
+    chmod 700 "$CONFIG_DIR" 2>/dev/null || log_message "WARNING" "Cannot set permissions on: $CONFIG_DIR"
+
+    if [[ -f "$cfg" ]]; then
+        chmod 600 "$cfg" 2>/dev/null || log_message "WARNING" "Cannot set permissions on: $cfg"
+
+        if ! bash -n "$cfg" 2>/dev/null; then
+            log_message "ERROR" "Syntax error in config file: $cfg"
+            return 1
+        fi
+
+        # shellcheck source=/dev/null
+        source "$cfg" || {
+            log_message "ERROR" "Failed to source config file: $cfg"
+            return 1
+        }
+    else
+        log_message "INFO" "No config file found at $cfg — using defaults."
+    fi
+
+    CONFIG_FILE="$cfg"
+
+    # Re-derive path variables that embed SQL_PORT (which may have just changed).
     PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.pid"
     SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}_${SQL_PORT}.server.pid"
     LOGFILE="${CONFIG_DIR}/sqmate_${PROFILE}.log"
     SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
-
-    # Configuration loaded successfully
-    return 0
 }
 
-# Function: saves current configuration to file.
+# save_config — write the current runtime state to the profile config file.
 save_config() {
-    # Log save operation
-    log_message "DEBUG" "Saving configuration to $CONFIG_FILE"
-
-    # Ensure config directory exists
     mkdir -p "$(dirname "$CONFIG_FILE")" || {
-        log_message "ERROR" "Failed to create config directory: $(dirname "$CONFIG_FILE")"
+        log_message "ERROR" "Cannot create config directory: $(dirname "$CONFIG_FILE")"
         return 1
     }
 
-    # Resolve absolute paths
     local abs_sql_dir
-    abs_sql_dir=$(realpath -m "$SQL_DIR" 2> /dev/null) || abs_sql_dir="$SQL_DIR"
+    abs_sql_dir=$(realpath -m "$SQL_DIR" 2>/dev/null) || abs_sql_dir="$SQL_DIR"
 
-    # Write configuration to file
-    if ! cat > "$CONFIG_FILE" << EOF; then
-# SQMATE Configuration for profile: $PROFILE
-SQL_HOST="$SQL_HOST"
-SQL_PORT="$SQL_PORT"
-SQL_DIR="$abs_sql_dir"
-SQL_ENGINE="$SQL_ENGINE"
-SOCKET_FILE="$SOCKET_FILE"
+    if ! cat > "$CONFIG_FILE" <<EOF
+# sqmate configuration — profile: ${PROFILE}
+# Auto-generated by sqmate ${VERSION}. Edit with care.
+SQL_HOST="${SQL_HOST}"
+SQL_PORT="${SQL_PORT}"
+SQL_DIR="${abs_sql_dir}"
+SQL_ENGINE="${SQL_ENGINE}"
+SOCKET_FILE="${SOCKET_FILE}"
 EOF
-        log_message "ERROR" "Failed to save configuration to $CONFIG_FILE."
+    then
+        log_message "ERROR" "Failed to write config file: $CONFIG_FILE"
         return 1
     fi
 
-    # Set file permissions
-    chmod 600 "$CONFIG_FILE" || log_message "WARNING" "Failed to set permissions on config file"
+    chmod 600 "$CONFIG_FILE" || log_message "WARNING" "Cannot set permissions on: $CONFIG_FILE"
+}
 
-    # Log success
-    log_message "DEBUG" "Configuration saved successfully"
+# _pidfile_create — write a new tracking PID file for the running server.
+_pidfile_create() {
+    local server_pid="$1"
 
-    # Configuration saved successfully
+    local abs_sql_dir
+    abs_sql_dir=$(realpath -m "$SQL_DIR" 2>/dev/null) || abs_sql_dir="$SQL_DIR"
+
+    if ! cat > "$PIDFILE" <<EOF
+SQL_HOST=${SQL_HOST}
+SQL_PORT=${SQL_PORT}
+SQL_DIR=${abs_sql_dir}
+SQL_ENGINE=${SQL_ENGINE}
+DATA_DIR=${abs_sql_dir}/data
+SOCKET_FILE=${SOCKET_FILE}
+PID=${server_pid}
+PROFILE=${PROFILE}
+EOF
+    then
+        log_message "ERROR" "Failed to write PID file: $PIDFILE"
+        return 1
+    fi
+
+    chmod 600 "$PIDFILE" 2>/dev/null || log_message "WARNING" "Cannot set permissions on: $PIDFILE"
+}
+
+# _pidfile_read — read and validate the tracking PID file.
+_pidfile_read() {
+    [[ -f "$PIDFILE" ]] || return 1
+
+    local content
+    content=$(cat "$PIDFILE")
+
+    if ! grep -q '^PID='      <<< "$content" \
+    || ! grep -q '^SQL_HOST=' <<< "$content" \
+    || ! grep -q '^SQL_PORT=' <<< "$content"; then
+        log_message "ERROR" "PID file has invalid format: $PIDFILE"
+        rm -f "$PIDFILE" 2>/dev/null
+        return 1
+    fi
+
+    printf '%s\n' "$content"
+}
+
+# _pidfile_get — extract a single value from the tracking PID file.
+_pidfile_get() {
+    local key="$1"
+    local data
+    data=$(_pidfile_read) || return 1
+    
+    local line
+    line=$(grep "^${key}=" <<< "$data" 2>/dev/null) || return 1
+    
+    # Pure bash parameter expansion instead of subshell cut
+    printf '%s\n' "${line#*=}"
+}
+
+# _pidfile_check — verify that the PID in the tracking file corresponds to a live process.
+_pidfile_check() {
+    local data server_pid port line
+    data=$(_pidfile_read) || return 1
+
+    line=$(grep '^PID=' <<< "$data")
+    server_pid="${line#*=}"
+    
+    line=$(grep '^SQL_PORT=' <<< "$data")
+    port="${line#*=}"
+
+    if [[ -z "$server_pid" || ! "$server_pid" =~ ^[0-9]+$ ]]; then
+        log_message "WARNING" "Invalid PID in tracking file: $PIDFILE"
+        rm -f "$PIDFILE" 2>/dev/null
+        return 1
+    fi
+
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+        log_message "WARNING" "Process $server_pid no longer exists — removing stale PID file."
+        rm -f "$PIDFILE" 2>/dev/null
+        return 1
+    fi
+
+    if command -v lsof &>/dev/null; then
+        if ! lsof -i :"$port" -sTCP:LISTEN -t 2>/dev/null | grep -q "^${server_pid}$"; then
+            log_message "WARNING" "PID $server_pid is not listening on port $port — removing stale PID file."
+            rm -f "$PIDFILE" 2>/dev/null
+            return 1
+        fi
+    fi
+
     return 0
 }
 
-# Function: show current configuration.
-show_config() {
-    local engine_display="${SQL_ENGINE:-Not detected}"
-    if [ -n "$SQL_ENGINE" ]; then
-        engine_display="${SQL_ENGINE^}"  # Capitalize first letter
-    fi
-
-    printf "Current Configuration (%s):\n" "$PROFILE"
-    printf "  %-15s %s\n" "Profile:" "$PROFILE"
-    printf "  %-15s %s\n" "Engine:" "$engine_display"
-    printf "  %-15s %s\n" "SQL Host:" "$SQL_HOST"
-    printf "  %-15s %s\n" "SQL Port:" "$SQL_PORT"
-    printf "  %-15s %s\n" "SQL Directory:" "${SQL_DIR:-Not configured}"
-    printf "  %-15s %s\n" "Data Directory:" "${SQL_DIR:+${SQL_DIR}/data}"
-    printf "  %-15s %s\n" "Socket File:" "$SOCKET_FILE"
-    printf "  %-15s %s\n" "Log Level:" "$LOG_LEVEL"
-    printf "  %-15s %s\n" "Config File:" "$CONFIG_FILE"
-    printf "  %-15s %s\n" "Log File:" "$LOGFILE"
-}
-
-# --- Server Management ---
-
-# Function: Clean up all PID-related files for current profile
+# cleanup_pid_files — remove all tracking and socket files for a given profile.
 cleanup_pid_files() {
     local profile="${1:-$PROFILE}"
-    
-    log_message "DEBUG" "Cleaning up all files for profile: $profile"
-    
-    # Remove SQMATE tracking PID
-    rm -f "${CONFIG_DIR}/sqmate_${profile}.pid" 2>/dev/null
-    
-    # Remove server PID files (with port patterns)
+
+    rm -f "${CONFIG_DIR}/sqmate_${profile}.pid"        2>/dev/null
     rm -f "${CONFIG_DIR}/sqmate_${profile}_"*.server.pid 2>/dev/null
-    
-    # Remove socket file(s) for this profile
-    rm -f "/tmp/sqmate_${profile}_"*.sock 2>/dev/null
-    
-    # Could also clean up stale entries from other profiles if needed
+    rm -f "/tmp/sqmate_${profile}_"*.sock              2>/dev/null
 }
 
-# Function: finds processes listening on a specified port.
-find_port_processes() {
-    # Input parameter
-    local port="$1"
-    local pids=()
+# _cleanup_on_exit — trap handler: clean up PID files on SIGINT / SIGTERM.
+_cleanup_on_exit() {
+    cleanup_pid_files "$PROFILE" 2>/dev/null || true
+}
+trap '_cleanup_on_exit; exit 1' INT TERM
 
-    # Check for available tools and find PIDs
-    if command -v lsof > /dev/null 2>&1; then
-        mapfile -t pids < <(lsof -i :"$port" -sTCP:LISTEN -t 2> /dev/null)
-    elif command -v ss > /dev/null 2>&1; then
-        mapfile -t pids < <(ss -tuln | grep -w "$port" | awk '{print $NF}' | grep -o '[0-9]\+' | sort -u)
+# ==============================================================================
+# VALIDATION — COMPOSITE HELPERS
+# ==============================================================================
+
+# find_port_processes — return PIDs of processes listening on a given TCP port.
+find_port_processes() {
+    local port="$1"
+    local -a pids=()
+    local pid
+
+    # Replaced mapfile with while-read for compatibility, though on modern
+    # systems mapfile is perfectly fine.
+    if command -v lsof &>/dev/null; then
+        while IFS= read -r pid; do
+            [[ -n "$pid" ]] && pids+=("$pid")
+        done < <(lsof -i :"$port" -sTCP:LISTEN -t 2>/dev/null)
+    elif command -v ss &>/dev/null; then
+        while IFS= read -r pid; do
+            [[ -n "$pid" ]] && pids+=("$pid")
+        done < <(ss -tuln | grep -w "$port" | awk '{print $NF}' | grep -o '[0-9]\+' | sort -u)
     fi
 
-    # Output found PIDs
-    echo "${pids[@]}"
+    echo "${pids[@]:-}"
 }
 
-# Function: prompts user for SQL directory.
+# ==============================================================================
+# SERVER LIFECYCLE
+# ==============================================================================
+
+# prompt_sql_directory — interactively ask the user for the MySQL/MariaDB installation path.
 prompt_sql_directory() {
     local current_dir="${SQL_DIR:-}"
-    
-    if [ -n "$current_dir" ]; then
-        log_message "WARNING" "Current SQL directory: $current_dir"
-        echo "SQL directory has changed or is invalid."
-        echo "Current configured directory: $current_dir"
-        echo
+
+    if [[ -n "$current_dir" ]]; then
+        log_message "WARNING" "Current SQL directory is missing or invalid: $current_dir"
+        printf "Please enter the path to a valid MySQL/MariaDB installation:\n"
+    else
+        printf "Please enter the path to your MySQL/MariaDB installation directory:\n"
     fi
-    
-    echo "Please enter the path to your MySQL/MariaDB installation directory:"
-    echo "(This should contain the 'bin' subdirectory with mysqld or mariadbd)"
-    echo
-    read -r sql_dir_input
-    
-    # Sanitize input
-    sql_dir_input=$(echo "$sql_dir_input" | tr -d '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    
-    if [ -z "$sql_dir_input" ]; then
-        log_message "ERROR" "SQL directory cannot be empty"
+
+    printf "(It must contain a 'bin/' subdirectory with mysqld or mariadbd)\n\n"
+    IFS= read -r sql_dir_input
+
+    sql_dir_input="${sql_dir_input#"${sql_dir_input%%[![:space:]]*}"}"
+    sql_dir_input="${sql_dir_input%"${sql_dir_input##*[![:space:]]}"}"
+
+    if [[ -z "$sql_dir_input" ]]; then
+        log_message "ERROR" "SQL directory cannot be empty."
         return 1
     fi
-    
-    # Expand tilde
-    if [[ "$sql_dir_input" =~ ^~ ]]; then
-        sql_dir_input="${sql_dir_input/#\~/$HOME}"
-    fi
-    
-    # Validate directory
-    if ! validate_path "$sql_dir_input" "dir" "SQL directory"; then
+
+    [[ "$sql_dir_input" == ~* ]] && sql_dir_input="${sql_dir_input/#\~/$HOME}"
+
+    validate_path "$sql_dir_input" "dir" "SQL directory" || return 1
+
+    if [[ ! -f "${sql_dir_input}/bin/mariadbd" && ! -f "${sql_dir_input}/bin/mysqld" ]]; then
+        log_message "ERROR" "Not a valid MySQL/MariaDB installation: '$sql_dir_input'"
+        log_message "ERROR" "Expected: ${sql_dir_input}/bin/mysqld  or  ${sql_dir_input}/bin/mariadbd"
         return 1
     fi
-    
-    # Check for MariaDB binary first
-    if ! validate_path "${sql_dir_input}/bin/mariadbd" "file" "MariaDB server binary" 2>/dev/null && \
-       ! validate_path "${sql_dir_input}/bin/mysqld" "file" "SQL server binary"; then
-        log_message "ERROR" "Directory '$sql_dir_input' does not appear to be a valid MySQL/MariaDB installation"
-        log_message "ERROR" "Expected to find either: ${sql_dir_input}/bin/mariadbd or ${sql_dir_input}/bin/mysqld"
-        return 1
-    fi
-    
+
     SQL_DIR="$sql_dir_input"
-    return 0
 }
 
-# Function: initializes SQL data directory based on engine type.
+# initialize_data_directory — run the engine-appropriate data-directory initialisation command.
 initialize_data_directory() {
     local data_dir="${SQL_DIR}/data"
-    local base_dir="$SQL_DIR"
-    
-    log_message "INFO" "Initializing ${SQL_ENGINE^} data directory at: $data_dir"
-    
-    if [ "$SQL_ENGINE" = "mariadb" ]; then
-        # MariaDB initialization - try mysql_install_db first, fallback to mysqld --initialize
-        local install_db_path="${SQL_DIR}/scripts/mysql_install_db"
-        
-        if [ -f "$install_db_path" ] && [ -x "$install_db_path" ]; then
-            log_message "INFO" "Using MariaDB mysql_install_db script"
-            if ! "$install_db_path" --datadir="$data_dir" --basedir="$base_dir" --user="$(whoami)"; then
-                log_message "WARNING" "mysql_install_db failed, trying mysqld --initialize"
-                if ! "$SQL_BIN" --initialize-insecure --datadir="$data_dir" --basedir="$base_dir"; then
-                    log_message "ERROR" "Failed to initialize MariaDB data directory"
+
+    log_message "INFO" "Initialising ${SQL_ENGINE^} data directory: $data_dir"
+
+    if [[ "$SQL_ENGINE" == "mariadb" ]]; then
+        local install_db="${SQL_DIR}/scripts/mysql_install_db"
+
+        if [[ -f "$install_db" && -x "$install_db" ]]; then
+            log_message "INFO" "Using mysql_install_db script."
+            "$install_db" --datadir="$data_dir" --basedir="$SQL_DIR" --user="$(whoami)" || {
+                log_message "WARNING" "mysql_install_db failed; falling back to --initialize-insecure."
+                "$SQL_BIN" --initialize-insecure --datadir="$data_dir" --basedir="$SQL_DIR" || {
+                    log_message "ERROR" "Both MariaDB initialisation methods failed."
                     return 1
-                fi
-            fi
+                }
+            }
         else
-            log_message "INFO" "Using mysqld --initialize for MariaDB"
-            if ! "$SQL_BIN" --initialize-insecure --datadir="$data_dir" --basedir="$base_dir"; then
-                log_message "ERROR" "Failed to initialize MariaDB data directory"
+            log_message "INFO" "mysql_install_db not found; using mysqld --initialize-insecure."
+            "$SQL_BIN" --initialize-insecure --datadir="$data_dir" --basedir="$SQL_DIR" || {
+                log_message "ERROR" "Failed to initialise MariaDB data directory."
                 return 1
-            fi
+            }
         fi
-        
-        log_message "SUCCESS" "MariaDB data directory initialized (no root password set)"
-        log_message "INFO" "You can set a root password after connecting with:"
-        log_message "INFO" "  SET PASSWORD FOR 'root'@'localhost' = PASSWORD('your_password');"
-        
+
+        log_message "SUCCESS" "MariaDB data directory initialised (no root password set)."
+        log_message "INFO" "Set a root password after connecting:"
+        log_message "INFO" "  SET PASSWORD FOR 'root'@'localhost' = PASSWORD('yourpass');"
+
     else
-        # MySQL initialization
-        log_message "INFO" "Using mysqld --initialize for MySQL"
-        if ! "$SQL_BIN" --initialize --datadir="$data_dir" --basedir="$base_dir"; then
-            log_message "ERROR" "Failed to initialize MySQL data directory"
+        log_message "INFO" "Using mysqld --initialize (MySQL)."
+        "$SQL_BIN" --initialize --datadir="$data_dir" --basedir="$SQL_DIR" || {
+            log_message "ERROR" "Failed to initialise MySQL data directory."
             return 1
-        fi
-        
-        log_message "SUCCESS" "MySQL data directory initialized successfully"
-        log_message "WARNING" "Please check ${SQL_DIR}/logs/mysqld_error.log for the temporary root password"
-        log_message "INFO" "Change the root password after first connection using:"
-        log_message "INFO" "  ALTER USER 'root'@'localhost' IDENTIFIED BY 'your_new_password';"
+        }
+
+        log_message "SUCCESS" "MySQL data directory initialised."
+        log_message "WARNING" "Temporary root password is in: ${SQL_DIR}/logs/mysqld_error.log"
+        log_message "INFO" "Change it after first login:"
+        log_message "INFO" "  ALTER USER 'root'@'localhost' IDENTIFIED BY 'yourpass';"
     fi
-    
-    return 0
 }
 
-# Function: initializes SQL data directory and configuration.
+# init_sql — interactive initialisation
 init_sql() {
-    log_message "INFO" "Initializing SQL configuration for profile: $PROFILE"
-    
-    # Prompt for SQL directory if not set or invalid
-    if [ -z "$SQL_DIR" ] || ! validate_sql 2>/dev/null; then
-        if ! prompt_sql_directory; then
-            return 1
-        fi
+    log_message "INFO" "Initialising sqmate configuration for profile: $PROFILE"
+
+    if [[ -z "$SQL_DIR" ]] || ! validate_sql 2>/dev/null; then
+        prompt_sql_directory || return 1
     fi
-    
-    # Validate SQL installation and detect engine
+
     validate_sql || return 1
-    
-    # Display detected engine
-    log_message "SUCCESS" "Detected ${SQL_ENGINE^} installation"
-    
-    # Create data directory
+    log_message "SUCCESS" "Detected ${SQL_ENGINE^} installation."
+
     local data_dir="${SQL_DIR}/data"
     local logs_dir="${SQL_DIR}/logs"
-    
+
     mkdir -p "$data_dir" "$logs_dir" || {
-        log_message "ERROR" "Failed to create data/logs directories"
+        log_message "ERROR" "Cannot create data/logs directories under: $SQL_DIR"
         return 1
     }
-    
-    # Check if already initialized
-    if [ -d "$data_dir/mysql" ]; then
-        log_message "WARNING" "SQL data directory already initialized at: $data_dir"
+
+    if [[ -d "${data_dir}/mysql" ]]; then
+        log_message "WARNING" "Data directory already initialised: $data_dir"
     else
-        # Initialize based on detected engine
         initialize_data_directory || return 1
     fi
-    
-    # Save configuration
+
     save_config || return 1
-    log_message "SUCCESS" "Configuration saved to: $CONFIG_FILE"
-    
-    # Show current configuration
-    echo
-    show_config
-    
-    return 0
+    log_message "SUCCESS" "Configuration saved: $CONFIG_FILE"
 }
 
-# Function: starts the SQL server.
+# start_server — start the mysqld/mariadbd process for the current profile.
 start_server() {
-    # Validate SQL installation
     validate_sql || return 1
-
-    # Check port availability
     check_port_available "$SQL_HOST" "$SQL_PORT" || return 1
 
-    # Set up paths
     local data_dir="${SQL_DIR}/data"
     local logs_dir="${SQL_DIR}/logs"
     local error_log="${logs_dir}/mysqld_error.log"
     local general_log="${logs_dir}/mysqld_general.log"
 
-    # Validate data directory
     validate_path "$data_dir" "dir" "SQL data directory" || {
-        log_message "ERROR" "SQL data directory not found. Run 'sqmate init' first."
+        log_message "ERROR" "Data directory not found. Run 'sqmate init' first."
         return 1
     }
 
-    # Check if data directory is initialized
-    if [ ! -d "$data_dir/mysql" ]; then
-        log_message "ERROR" "SQL data directory not initialized. Run 'sqmate init' first."
+    if [[ ! -d "${data_dir}/mysql" ]]; then
+        log_message "ERROR" "Data directory not initialised. Run 'sqmate init' first."
         return 1
     fi
 
-    # Create logs directory
     mkdir -p "$logs_dir" || {
-        log_message "ERROR" "Failed to create logs directory: $logs_dir"
+        log_message "ERROR" "Cannot create logs directory: $logs_dir"
         return 1
     }
 
-    # Check for existing server
-    if manage_pidfile check; then
-        log_message "WARNING" "${SQL_ENGINE^} server is already running. Use 'sqmate restart' or stop it first."
+    if _pidfile_check; then
+        log_message "WARNING" "${SQL_ENGINE^} server is already running. Use 'sqmate restart' to cycle it."
         return 1
     fi
 
-    # Build server command - check if --daemonize is supported
-    local daemon_option=""
-    if "$SQL_BIN" --help --verbose 2>/dev/null | grep -q -- "--daemonize"; then
-        daemon_option="--daemonize"
-        log_message "DEBUG" "Using --daemonize option"
+    local daemon_flag=""
+    if "$SQL_BIN" --help --verbose 2>/dev/null | grep -q -- '--daemonize'; then
+        daemon_flag="--daemonize"
     else
-        log_message "DEBUG" "MariaDB version does not support --daemonize, starting in background mode"
+        log_message "INFO" "Engine does not support --daemonize; starting in background."
     fi
-    
-    local start_command="\"$SQL_BIN\" --datadir=\"$data_dir\" --basedir=\"$SQL_DIR\" --socket=\"$SOCKET_FILE\" --port=\"$SQL_PORT\" --bind-address=\"$SQL_HOST\" --pid-file=\"$SERVER_PIDFILE\" --log-error=\"$error_log\" --general-log --general-log-file=\"$general_log\" $daemon_option"
 
-    # Log server start details
-    log_message "INFO" "Starting ${SQL_ENGINE^} server at $SQL_HOST:$SQL_PORT"
-    log_message "INFO" "  Data directory: $data_dir"
-    log_message "INFO" "  Socket file: $SOCKET_FILE"
+    local base_args=(
+        --datadir="$data_dir"
+        --basedir="$SQL_DIR"
+        --socket="$SOCKET_FILE"
+        --port="$SQL_PORT"
+        --bind-address="$SQL_HOST"
+        --pid-file="$SERVER_PIDFILE"
+        --log-error="$error_log"
+        --general-log
+        --general-log-file="$general_log"
+    )
+
+    log_message "INFO" "Starting ${SQL_ENGINE^} server on ${SQL_HOST}:${SQL_PORT}"
+    log_message "INFO" "  Data dir : $data_dir"
+    log_message "INFO" "  Socket   : $SOCKET_FILE"
     log_message "INFO" "  Error log: $error_log"
-    [[ "$PROFILE" != "default" ]] && log_message "INFO" "  Profile: $PROFILE"
+    [[ "$PROFILE" != "default" ]] && log_message "INFO" "  Profile  : $PROFILE"
 
-    # Start server - always run in background to free the console
-    log_message "DEBUG" "Starting server with command: $start_command"
-    if [ -n "$daemon_option" ]; then
-        # Use daemonize option if available
-        eval "$start_command" || {
-            log_message "ERROR" "Failed to start ${SQL_ENGINE^} server. Check error log: $error_log"
+    if [[ -n "$daemon_flag" ]]; then
+        "$SQL_BIN" "${base_args[@]}" "$daemon_flag" || {
+            log_message "ERROR" "Server failed to start. See: $error_log"
             return 1
         }
     else
-        # Start in background for older MariaDB versions or when daemonize not available
-        eval "$start_command" > /dev/null 2>&1 &
+        "$SQL_BIN" "${base_args[@]}" >/dev/null 2>&1 &
         local bg_pid=$!
-        # Give it a moment to start
         sleep 1
-        # Check if the background process is still running (didn't immediately fail)
         if ! kill -0 "$bg_pid" 2>/dev/null; then
-            log_message "ERROR" "Failed to start ${SQL_ENGINE^} server. Check error log: $error_log"
+            log_message "ERROR" "Server exited immediately. See: $error_log"
             return 1
         fi
     fi
 
-    # Wait for SQL PID file to be created
-    local attempt=0 max_attempts=10
-    local sql_pid=""
-    while [ "$attempt" -lt "$max_attempts" ]; do
-        if [ -f "$SERVER_PIDFILE" ]; then
+    local attempt=0 max_attempts=10 sql_pid=""
+    while (( attempt < max_attempts )); do
+        if [[ -f "$SERVER_PIDFILE" ]]; then
             sql_pid=$(cat "$SERVER_PIDFILE" 2>/dev/null)
-            if [ -n "$sql_pid" ] && kill -0 "$sql_pid" 2>/dev/null; then
+            if [[ -n "$sql_pid" ]] && kill -0 "$sql_pid" 2>/dev/null; then
                 break
             fi
         fi
         sleep 1
-        attempt=$((attempt + 1))
+        (( ++attempt ))
     done
 
-    if [ -z "$sql_pid" ] || ! kill -0 "$sql_pid" 2>/dev/null; then
-        log_message "ERROR" "${SQL_ENGINE^} server failed to start properly. Check error log: $error_log"
-        # Clean up the server PID file if it exists
+    if [[ -z "$sql_pid" ]] || ! kill -0 "$sql_pid" 2>/dev/null; then
+        log_message "ERROR" "Server did not write a valid PID. See: $error_log"
         rm -f "$SERVER_PIDFILE" 2>/dev/null
         return 1
     fi
 
-    # Create our PID file
-    if ! manage_pidfile create "$sql_pid"; then
-        log_message "ERROR" "Failed to create PID file"
-        kill "$sql_pid" 2> /dev/null
+    _pidfile_create "$sql_pid" || {
+        log_message "ERROR" "Cannot write tracking PID file."
+        kill "$sql_pid" 2>/dev/null
         return 1
-    fi
+    }
 
-    # Verify server is listening on port
-    local attempt=0 max_attempts=10
     local port_bound=0
-    while [ "$attempt" -lt "$max_attempts" ]; do
-        if command -v lsof > /dev/null 2>&1; then
-            if lsof -i :"$SQL_PORT" -sTCP:LISTEN -t 2> /dev/null | grep -q "^$sql_pid$"; then
-                port_bound=1
-                break
-            fi
-        elif command -v ss > /dev/null 2>&1; then
-            if ss -tuln | grep -qE "($SQL_HOST|0.0.0.0|\[::\]):$SQL_PORT\s"; then
-                port_bound=1
-                break
-            fi
+    attempt=0
+    while (( attempt < max_attempts )); do
+        if command -v lsof &>/dev/null; then
+            lsof -i :"$SQL_PORT" -sTCP:LISTEN -t 2>/dev/null \
+                | grep -q "^${sql_pid}$" && { port_bound=1; break; }
+        elif command -v ss &>/dev/null; then
+            ss -tuln \
+                | grep -qE "(${SQL_HOST}|0\.0\.0\.0|\[::\]):${SQL_PORT}[[:space:]]" \
+                && { port_bound=1; break; }
+        else
+            port_bound=1
+            break
         fi
         sleep 1
-        attempt=$((attempt + 1))
+        (( ++attempt ))
     done
 
-    if [ "$port_bound" -eq 0 ]; then
-        log_message "ERROR" "${SQL_ENGINE^} server failed to bind to port $SQL_PORT. Check error log: $error_log"
-        kill "$sql_pid" 2> /dev/null
-        manage_pidfile cleanup
+    if (( port_bound == 0 )); then
+        log_message "ERROR" "Server did not bind to port $SQL_PORT. See: $error_log"
+        kill "$sql_pid" 2>/dev/null
+        cleanup_pid_files "$PROFILE"
         return 1
     fi
 
-    # Log success
-    log_message "SUCCESS" "${SQL_ENGINE^} server started successfully with PID: $sql_pid"
-
-    # Server started successfully
-    return 0
+    log_message "SUCCESS" "${SQL_ENGINE^} server started (PID: ${sql_pid})."
 }
 
-# Function: stops the SQL server
+# stop_server — gracefully stop the running server for the current profile.
 stop_server() {
-    # Initialize variables
-    local server_pid sql_host sql_port sql_engine
-    local found_server=0
+    local server_pid sql_host sql_port sql_engine found_server=0
 
-    # Attempt to retrieve server info from PID file
-    if manage_pidfile check; then
-        server_pid=$(manage_pidfile get_value "PID")
-        sql_host=$(manage_pidfile get_value "SQL_HOST")
-        sql_port=$(manage_pidfile get_value "SQL_PORT")
-        sql_engine=$(manage_pidfile get_value "SQL_ENGINE")
+    if _pidfile_check; then
+        server_pid=$(_pidfile_get "PID")
+        sql_host=$(   _pidfile_get "SQL_HOST")
+        sql_port=$(   _pidfile_get "SQL_PORT")
+        sql_engine=$( _pidfile_get "SQL_ENGINE")
         found_server=1
     else
-        # Fallback to checking port directly
         sql_host="$SQL_HOST"
         sql_port="$SQL_PORT"
         sql_engine="${SQL_ENGINE:-SQL}"
         local port_pids
         port_pids=$(find_port_processes "$sql_port")
-        if [ -n "$port_pids" ]; then
+        if [[ -n "$port_pids" ]]; then
             server_pid="$port_pids"
             found_server=1
         fi
     fi
 
-    # Handle case where no server is found
-    if [ "$found_server" -eq 0 ]; then
-        log_message "INFO" "No running SQL server found"
-        manage_pidfile cleanup
-
+    if (( found_server == 0 )); then
+        log_message "INFO" "No running SQL server found for profile: $PROFILE"
+        cleanup_pid_files "$PROFILE"
         return 0
     fi
 
-    # Stop the server process
     local failed=0
-    if ! kill -0 "$server_pid" 2> /dev/null; then
-        log_message "WARNING" "Process $server_pid not found or already terminated"
-    else
-        log_message "INFO" "Stopping ${sql_engine^} server process $server_pid on $sql_host:$sql_port"
 
-        # Send SIGTERM for graceful shutdown
-        kill -TERM "$server_pid" 2> /dev/null || log_message "WARNING" "Failed to send SIGTERM to $server_pid"
-        
-        # Wait for graceful shutdown (up to 30 seconds)
-        local attempt=0 max_attempts=30
-        while [ "$attempt" -lt "$max_attempts" ] && kill -0 "$server_pid" 2> /dev/null; do
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+        log_message "WARNING" "Process $server_pid already gone."
+    else
+        log_message "INFO" "Stopping ${sql_engine^} (PID: ${server_pid}) on ${sql_host}:${sql_port}…"
+
+        kill -TERM "$server_pid" 2>/dev/null \
+            || log_message "WARNING" "SIGTERM delivery failed for PID $server_pid."
+
+        local attempt=0
+        while (( attempt < 30 )) && kill -0 "$server_pid" 2>/dev/null; do
             sleep 1
-            attempt=$((attempt + 1))
+            (( ++attempt ))
         done
 
-        # Use SIGKILL if necessary
-        if kill -0 "$server_pid" 2> /dev/null; then
-            log_message "WARNING" "Process $server_pid did not terminate gracefully. Sending SIGKILL..."
-            kill -9 "$server_pid" 2> /dev/null
+        if kill -0 "$server_pid" 2>/dev/null; then
+            log_message "WARNING" "Graceful shutdown timed out; sending SIGKILL to $server_pid."
+            kill -9 "$server_pid" 2>/dev/null
             sleep 2
-            if kill -0 "$server_pid" 2> /dev/null; then
-                log_message "ERROR" "Failed to terminate process $server_pid"
+            if kill -0 "$server_pid" 2>/dev/null; then
+                log_message "ERROR" "Cannot terminate process $server_pid."
                 failed=1
             fi
         fi
     fi
 
-    # Verify port is free
-    if command -v lsof > /dev/null 2>&1 && lsof -i :"$sql_port" -sTCP:LISTEN > /dev/null 2>&1; then
-        log_message "ERROR" "Port $sql_host:$sql_port is still in use"
-        failed=1
+    if command -v lsof &>/dev/null; then
+        local port_clear=0 p_attempt=0
+        while (( p_attempt < 5 )); do
+            lsof -i :"$sql_port" -sTCP:LISTEN &>/dev/null || { port_clear=1; break; }
+            sleep 1
+            (( ++p_attempt ))
+        done
+        if (( port_clear == 0 )); then
+            log_message "ERROR" "Port ${sql_host}:${sql_port} is still in use after 5 s."
+            failed=1
+        fi
     fi
 
-    # Clean up all PID-related files
     cleanup_pid_files "$PROFILE"
 
-    # Report result
-    if [ "$failed" -eq 0 ]; then
-        log_message "SUCCESS" "${sql_engine^} server stopped successfully"
+    if (( failed == 0 )); then
+        log_message "SUCCESS" "${sql_engine^} server stopped."
         return 0
     else
-        log_message "ERROR" "Failed to stop ${sql_engine^} server completely"
+        log_message "ERROR" "Server did not stop cleanly."
         return 1
     fi
 }
 
-# Function: checks the status of the SQL server
+# check_status — display live runtime status for the current profile.
 check_status() {
-    # Check if server is running
-    if ! manage_pidfile check; then
-        log_message "INFO" "No SQL server running"
+    if ! _pidfile_check; then
+        log_message "INFO" "No SQL server running for profile: $PROFILE"
         return 1
     fi
 
-    # Retrieve server information
-    local server_pid sql_host sql_port sql_dir sql_engine data_dir socket_file profile
-    server_pid=$(manage_pidfile get_value "PID")
-    sql_host=$(manage_pidfile get_value "SQL_HOST")
-    sql_port=$(manage_pidfile get_value "SQL_PORT")
-    sql_dir=$(manage_pidfile get_value "SQL_DIR")
-    sql_engine=$(manage_pidfile get_value "SQL_ENGINE")
-    data_dir=$(manage_pidfile get_value "DATA_DIR")
-    socket_file=$(manage_pidfile get_value "SOCKET_FILE")
-    profile=$(manage_pidfile get_value "PROFILE")
+    local pid host port dir engine data_dir socket profile start_time
 
-    # Display server status
-    log_message "INFO" "${sql_engine^} server is running"
-    printf "Server Status:\n"
-    printf "  %-15s %s\n" "Status:" "Running"
-    printf "  %-15s %s\n" "Engine:" "${sql_engine^}"
-    printf "  %-15s %s\n" "Profile:" "${profile:-default}"
-    printf "  %-15s %s\n" "PID:" "$server_pid"
-    printf "  %-15s %s\n" "URL:" "${sql_engine}://$sql_host:$sql_port/"
-    printf "  %-15s %s\n" "SQL Directory:" "$sql_dir"
-    printf "  %-15s %s\n" "Data Directory:" "$data_dir"
-    printf "  %-15s %s\n" "Socket File:" "$socket_file"
-    printf "  %-15s %s\n" "Log file:" "$LOGFILE"
+    pid=$(      _pidfile_get "PID")
+    host=$(     _pidfile_get "SQL_HOST")
+    port=$(     _pidfile_get "SQL_PORT")
+    dir=$(      _pidfile_get "SQL_DIR")
+    engine=$(   _pidfile_get "SQL_ENGINE")
+    data_dir=$( _pidfile_get "DATA_DIR")
+    socket=$(   _pidfile_get "SOCKET_FILE")
+    profile=$(  _pidfile_get "PROFILE")
 
-    # Show process start time if available
-    if command -v ps > /dev/null 2>&1; then
-        local start_time
-        start_time=$(ps -o lstart= -p "$server_pid" 2> /dev/null)
-        [ -n "$start_time" ] && printf "  %-15s %s\n" "Started:" "$start_time"
+    printf "Server Status (%s):\n" "${profile:-default}"
+    printf "  %-18s %s\n" "Status:"         "Running"
+    printf "  %-18s %s\n" "Engine:"         "${engine^}"
+    printf "  %-18s %s\n" "PID:"            "$pid"
+    printf "  %-18s %s\n" "URL:"            "${engine}://${host}:${port}/"
+    printf "  %-18s %s\n" "Socket File:"    "$socket"
+    printf "  %-18s %s\n" "SQL Directory:"  "$dir"
+    printf "  %-18s %s\n" "Data Directory:" "$data_dir"
+    printf "  %-18s %s\n" "Log File:"       "$LOGFILE"
+
+    if command -v ps &>/dev/null; then
+        start_time=$(ps -o lstart= -p "$pid" 2>/dev/null)
+        [[ -n "$start_time" ]] \
+            && printf "  %-18s %s\n" "Started:" "$start_time"
     fi
-
-    # Server is running
-    return 0
 }
 
-# Function: restarts the SQL server
+# restart_server — stop the running server, wait for the port to clear, then start.
 restart_server() {
-    # Log restart operation
-    log_message "INFO" "Restarting SQL server..."
-    
-    # Save current server configuration from PID file before stopping
-    local saved_host saved_port saved_sql_dir saved_engine saved_profile
-    local config_restored=false
-    
-    if manage_pidfile check; then
-        saved_host=$(manage_pidfile get_value "SQL_HOST")
-        saved_port=$(manage_pidfile get_value "SQL_PORT")
-        saved_sql_dir=$(manage_pidfile get_value "SQL_DIR")
-        saved_engine=$(manage_pidfile get_value "SQL_ENGINE")
-        saved_profile=$(manage_pidfile get_value "PROFILE")
-        
-        # Update current configuration with saved values
-        [[ -n "$saved_host" ]] && SQL_HOST="$saved_host"
-        [[ -n "$saved_port" ]] && SQL_PORT="$saved_port"
-        [[ -n "$saved_sql_dir" ]] && SQL_DIR="$saved_sql_dir"
-        [[ -n "$saved_engine" ]] && SQL_ENGINE="$saved_engine"
-        [[ -n "$saved_profile" ]] && PROFILE="$saved_profile"
-        
-        config_restored=true
-        
-        # Log restored configuration details
-        log_message "INFO" "Restoring previous configuration:"
-        log_message "INFO" "  Engine: ${SQL_ENGINE^}"
-        log_message "INFO" "  SQL directory: $SQL_DIR"
-        log_message "INFO" "  Host:Port: $SQL_HOST:$SQL_PORT"
-        [[ "$PROFILE" != "default" ]] && log_message "INFO" "  Profile: $PROFILE"
-        
-        log_message "DEBUG" "Full restored config - Engine: $SQL_ENGINE, Host: $SQL_HOST, Port: $SQL_PORT, SQL_Dir: $SQL_DIR, Profile: $PROFILE"
+    log_message "INFO" "Restarting SQL server for profile: $PROFILE"
+
+    if _pidfile_check; then
+        local s_host s_port s_dir s_engine s_profile
+        s_host=$(   _pidfile_get "SQL_HOST")
+        s_port=$(   _pidfile_get "SQL_PORT")
+        s_dir=$(    _pidfile_get "SQL_DIR")
+        s_engine=$( _pidfile_get "SQL_ENGINE")
+        s_profile=$(  _pidfile_get "PROFILE")
+
+        [[ -n "$s_host"    ]] && SQL_HOST="$s_host"
+        [[ -n "$s_port"    ]] && SQL_PORT="$s_port"
+        [[ -n "$s_dir"     ]] && SQL_DIR="$s_dir"
+        [[ -n "$s_engine"  ]] && SQL_ENGINE="$s_engine"
+        [[ -n "$s_profile" ]] && PROFILE="$s_profile"
+
+        log_message "INFO" "Restoring: engine=${SQL_ENGINE^}  dir=$SQL_DIR  addr=${SQL_HOST}:${SQL_PORT}"
     else
-        log_message "WARNING" "No previous server configuration found, using current settings"
+        log_message "WARNING" "No live server found — restarting with current settings."
     fi
-    
-    # Stop existing server
+
+    # stop_server inherently verifies that the port is freed before returning.
     stop_server
-    
-    # Wait until port is free (up to 10 seconds)
-    local attempt=0 max_attempts=10
-    while [ "$attempt" -lt "$max_attempts" ]; do
-        if check_port_available "$SQL_HOST" "$SQL_PORT"; then
-            break
-        fi
-        sleep 1
-        attempt=$((attempt + 1))
-    done
-    
-    if [ "$attempt" -eq "$max_attempts" ]; then
-        log_message "ERROR" "Port $SQL_HOST:$SQL_PORT still in use after waiting. Cannot restart server."
-        return 1
-    fi
-    
-    # Start new server with restored configuration
+
     start_server || return 1
-    
-    # Log success
-    log_message "SUCCESS" "SQL server restarted successfully"
-    
-    # Server restarted successfully
-    return 0
+    log_message "SUCCESS" "SQL server restarted."
 }
 
-# Function: connects to SQL server
-connect_sql() {
-    # Check if server is running
-    if ! manage_pidfile check; then
-        log_message "ERROR" "SQL server is not running. Start it first with: sqmate start"
-        return 1
-    fi
-
-    # Get connection details
-    local socket_file sql_engine
-    socket_file=$(manage_pidfile get_value "SOCKET_FILE")
-    sql_engine=$(manage_pidfile get_value "SQL_ENGINE")
-    
-    # Find SQL client - prefer mariadb over mysql for MariaDB installations
-    local sql_client=""
-    if [ "$sql_engine" = "mariadb" ]; then
-        # For MariaDB, prefer mariadb client over mysql client
-        if [ -f "${SQL_DIR}/bin/mariadb" ]; then
-            sql_client="${SQL_DIR}/bin/mariadb"
-            log_message "DEBUG" "Using mariadb client"
-        elif [ -f "${SQL_DIR}/bin/mysql" ]; then
-            sql_client="${SQL_DIR}/bin/mysql"
-            log_message "DEBUG" "Using mysql client (mariadb client not found)"
-        fi
-    else
-        # For MySQL, use mysql client
-        sql_client="${SQL_DIR}/bin/mysql"
-        log_message "DEBUG" "Using mysql client"
-    fi
-    
-    if [ -z "$sql_client" ] || ! validate_path "$sql_client" "file" "SQL client"; then
-        log_message "ERROR" "SQL client not found. Expected: ${SQL_DIR}/bin/mariadb or ${SQL_DIR}/bin/mysql"
-        return 1
-    fi
-
-    log_message "INFO" "Connecting to ${sql_engine^} server..."
-    
-    # For MariaDB with authentication issues, try multiple approaches
-    if [ "$sql_engine" = "mariadb" ]; then
-        log_message "INFO" "Attempting connection without password (MariaDB default)..."
-        
-        # Try connection without password first
-        if "$sql_client" -u root --socket="$socket_file" -e "SELECT 1;" >/dev/null 2>&1; then
-            log_message "SUCCESS" "Connected without password. Starting interactive session..."
-            "$sql_client" -u root --socket="$socket_file"
-        else
-            log_message "INFO" "No-password connection failed. Trying system user authentication..."
-            
-            # Try with current system user (unix_socket plugin)
-            local current_user
-            current_user=$(whoami)
-            if "$sql_client" -u "$current_user" --socket="$socket_file" -e "SELECT 1;" >/dev/null 2>&1; then
-                log_message "SUCCESS" "Connected as system user '$current_user'. Starting interactive session..."
-                log_message "INFO" "Note: You're connected as '$current_user', not 'root'"
-                "$sql_client" -u "$current_user" --socket="$socket_file"
-            else
-                log_message "INFO" "System user authentication failed. Trying with password..."
-                log_message "INFO" "Please enter the root password (press Enter if no password):"
-                "$sql_client" -u root -p --socket="$socket_file"
-            fi
-        fi
-    else
-        # For MySQL, always prompt for password
-        log_message "INFO" "Please enter the root password:"
-        "$sql_client" -u root -p --socket="$socket_file"
-    fi
-    
-    local connection_result=$?
-
-    # If all connection attempts failed, provide troubleshooting info
-    if [ $connection_result -ne 0 ]; then
-        echo ""
-        log_message "ERROR" "Connection failed. Here are some troubleshooting options:"
-        echo ""
-        echo "1. Reset MariaDB root authentication:"
-        echo "   sqmate stop"
-        echo "   sqmate reset-auth"
-        echo ""
-        echo "2. Manual reset (advanced):"
-        echo "   # Stop server and start in safe mode"
-        echo "   sqmate stop"
-        echo "   $SQL_BIN --skip-grant-tables --socket=/tmp/sqmate_temp_\$\$.sock \\"
-        echo "     --datadir=\"${SQL_DIR}/data\" &"
-        echo ""
-        echo "   # Connect and fix authentication"
-        echo "   $sql_client -u root --socket=/tmp/sqmate_temp_\$\$.sock"
-        echo "   # In MariaDB, run:"
-        echo "   #   FLUSH PRIVILEGES;"
-        echo "   #   ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('');"
-        echo "   #   EXIT;"
-        echo ""
-        echo "   # Kill safe mode and restart normally"
-        echo "   pkill $(basename "$SQL_BIN")"
-        echo "   sqmate start"
-        echo ""
-        echo "3. Check if you need to run as a different user:"
-        echo "   Current system user: $(whoami)"
-        echo "   Try: $sql_client -u $(whoami) --socket=\"$socket_file\""
-    fi
-}
-
-# Function: resets MariaDB/MySQL authentication
+# reset_auth — start the server in skip-grant-tables mode and reset the root password.
 reset_auth() {
-    # Validate SQL installation
     validate_sql || return 1
-    
-    local sql_engine="$SQL_ENGINE"
+
     local data_dir="${SQL_DIR}/data"
-    
-    log_message "INFO" "Resetting ${sql_engine^} authentication..."
-    
-    # Check if server is running and stop it
-    if manage_pidfile check; then
-        log_message "INFO" "Stopping running server..."
+
+    log_message "INFO" "Resetting ${SQL_ENGINE^} root authentication for profile: $PROFILE"
+
+    if _pidfile_check; then
+        log_message "INFO" "Stopping running server first…"
         stop_server || {
-            log_message "ERROR" "Failed to stop running server"
+            log_message "ERROR" "Cannot stop running server — aborting."
             return 1
         }
     fi
-    
-    # Wait a moment for cleanup
+
     sleep 2
-    
-    # Start server in safe mode
-    local temp_socket="/tmp/sqmate_reset_$.sock"
-    local temp_pid="/tmp/sqmate_reset_$.pid"
-    
-    log_message "INFO" "Starting server in safe mode (skip authentication)..."
-    "$SQL_BIN" --skip-grant-tables --skip-networking \
+
+    local temp_socket="/tmp/sqmate_reset_$$.sock"
+    local temp_pid="/tmp/sqmate_reset_$$.pid"
+
+    log_message "INFO" "Starting server in skip-grant-tables / skip-networking mode…"
+    "$SQL_BIN" \
+        --skip-grant-tables \
+        --skip-networking \
         --socket="$temp_socket" \
         --pid-file="$temp_pid" \
         --datadir="$data_dir" \
         --basedir="$SQL_DIR" &
-    
     local safe_pid=$!
-    
-    # Wait for server to start
-    local attempt=0 max_attempts=10
-    while [ "$attempt" -lt "$max_attempts" ]; do
-        if [ -S "$temp_socket" ]; then
-            break
-        fi
+
+    local attempt=0
+    while (( attempt < 15 )); do
+        [[ -S "$temp_socket" ]] && break
         sleep 1
-        attempt=$((attempt + 1))
+        (( ++attempt ))
     done
-    
-    if [ "$attempt" -eq "$max_attempts" ]; then
-        log_message "ERROR" "Failed to start server in safe mode"
+
+    if (( attempt >= 15 )); then
+        log_message "ERROR" "Safe-mode server did not start within 15 s."
         kill -9 "$safe_pid" 2>/dev/null
         rm -f "$temp_socket" "$temp_pid"
         return 1
     fi
-    
-    # Find SQL client
-    local sql_client=""
-    if [ "$sql_engine" = "mariadb" ]; then
-        if [ -f "${SQL_DIR}/bin/mariadb" ]; then
-            sql_client="${SQL_DIR}/bin/mariadb"
-        elif [ -f "${SQL_DIR}/bin/mysql" ]; then
-            sql_client="${SQL_DIR}/bin/mysql"
+
+    local client=""
+    if [[ "$SQL_ENGINE" == "mariadb" ]]; then
+        if   [[ -f "${SQL_DIR}/bin/mariadb" ]]; then client="${SQL_DIR}/bin/mariadb"
+        elif [[ -f "${SQL_DIR}/bin/mysql"   ]]; then client="${SQL_DIR}/bin/mysql"
         fi
     else
-        sql_client="${SQL_DIR}/bin/mysql"
+        client="${SQL_DIR}/bin/mysql"
     fi
-    
-    if [ -z "$sql_client" ]; then
-        log_message "ERROR" "SQL client not found"
+
+    if [[ -z "$client" ]]; then
+        log_message "ERROR" "SQL client binary not found."
         kill -9 "$safe_pid" 2>/dev/null
         rm -f "$temp_socket" "$temp_pid"
         return 1
     fi
-    
-    log_message "INFO" "Resetting root user authentication..."
-    
-    # Reset authentication based on engine type
-    if [ "$sql_engine" = "mariadb" ]; then
-        # For MariaDB, set up native password authentication
-        "$sql_client" -u root --socket="$temp_socket" <<EOF
+
+    log_message "INFO" "Applying authentication reset…"
+
+    local reset_sql
+    if [[ "$SQL_ENGINE" == "mariadb" ]]; then
+        reset_sql="
 FLUSH PRIVILEGES;
-ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('');
-DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
-FLUSH PRIVILEGES;
-EOF
+ALTER USER 'root'@'localhost'
+    IDENTIFIED VIA mysql_native_password USING PASSWORD('');
+DELETE FROM mysql.user
+    WHERE User='root' AND Host NOT IN ('localhost','127.0.0.1','::1');
+FLUSH PRIVILEGES;"
     else
-        # For MySQL
-        "$sql_client" -u root --socket="$temp_socket" <<EOF
+        reset_sql="
 FLUSH PRIVILEGES;
 ALTER USER 'root'@'localhost' IDENTIFIED BY '';
-DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
-FLUSH PRIVILEGES;
-EOF
+DELETE FROM mysql.user
+    WHERE User='root' AND Host NOT IN ('localhost','127.0.0.1','::1');
+FLUSH PRIVILEGES;"
     fi
-    
-    local reset_result=$?
-    
-    # Stop safe mode server
-    log_message "INFO" "Stopping safe mode server..."
+
+    "$client" -u root --socket="$temp_socket" <<< "$reset_sql"
+    local reset_rc=$?
+
+    log_message "INFO" "Shutting down safe-mode server…"
     kill -TERM "$safe_pid" 2>/dev/null
     sleep 2
-    if kill -0 "$safe_pid" 2>/dev/null; then
-        kill -9 "$safe_pid" 2>/dev/null
-    fi
-    
-    # Clean up temp files
+    kill -0 "$safe_pid" 2>/dev/null && kill -9 "$safe_pid" 2>/dev/null
     rm -f "$temp_socket" "$temp_pid"
-    
-    if [ "$reset_result" -eq 0 ]; then
-        log_message "SUCCESS" "Authentication reset successfully!"
-        log_message "INFO" "Root user now has no password and uses native password authentication"
-        log_message "INFO" "You can now start the server and connect:"
-        echo "  sqmate start"
-        echo "  sqmate connect"
+
+    if (( reset_rc == 0 )); then
+        log_message "SUCCESS" "Root authentication reset — no password, native plugin."
+        log_message "INFO" "Next steps:"
+        printf "  sqmate start\n  sqmate connect\n"
     else
-        log_message "ERROR" "Failed to reset authentication"
+        log_message "ERROR" "Authentication reset failed (SQL client returned $reset_rc)."
         return 1
     fi
-    
-    return 0
 }
 
-# Function: shows recent logs
+# show_logs — tail the engine error log (last 20 lines).
 show_logs() {
     local error_log="${SQL_DIR}/logs/mysqld_error.log"
-    local engine_name="${SQL_ENGINE^}"
-    
-    if [ -f "$error_log" ]; then
-        log_message "INFO" "Recent ${engine_name} error log entries ($error_log):"
-        echo "----------------------------------------"
+    local engine_label="${SQL_ENGINE^}"
+
+    if [[ -f "$error_log" ]]; then
+        log_message "INFO" "${engine_label} error log — last 20 lines ($error_log):"
+        printf -- '%.0s-' {1..60}; printf '\n'
         tail -20 "$error_log"
-        echo "----------------------------------------"
+        printf -- '%.0s-' {1..60}; printf '\n'
     else
-        log_message "WARNING" "${engine_name} error log file not found: $error_log"
-        log_message "INFO" "Server may not be initialized. Run 'sqmate init' first."
+        log_message "WARNING" "${engine_label} error log not found: $error_log"
+        log_message "INFO"    "Run 'sqmate init' to initialise the data directory."
     fi
 }
 
-# --- Main Script Execution ---
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
 
-# Function: guard against missing external tools
-check_required_tools() {
-    local missing_tools=()
-    
-    # Core required tools
-    local required_tools=("ps" "kill" "realpath")
-    
-    # Optional tools (with descriptions of what they're used for)
-    local optional_tools=("ss" "lsof")
-    
-    for tool in "${required_tools[@]}"; do
-        if ! command -v "$tool" > /dev/null 2>&1; then
-            missing_tools+=("$tool")
-        fi
-    done
-    
-    if [[ ${#missing_tools[@]} -gt 0 ]]; then
-        log_message "ERROR" "Missing required tools: ${missing_tools[*]}"
-        log_message "ERROR" "Please install these tools and try again"
-        return 1
-    fi
-    
-    # Check optional tools and warn about missing functionality
-    local missing_optional=()
-    for tool in "${optional_tools[@]}"; do
-        if ! command -v "$tool" > /dev/null 2>&1; then
-            missing_optional+=("$tool")
-        fi
-    done
-    
-    # Warn about specific missing optional tools
-    if [[ ${#missing_optional[@]} -eq ${#optional_tools[@]} ]]; then
-        # All optional tools are missing
-        log_message "WARNING" "Optional tools missing: ${missing_optional[*]}. Port availability checking disabled."
-    elif [[ ${#missing_optional[@]} -gt 0 ]]; then
-        # Some optional tools are missing
-        log_message "DEBUG" "Optional tools not found: ${missing_optional[*]}"
-    fi
-    
-    return 0
-}
-# Function: main entry point
+# main — parse the command name, load config, validate tooling, process options,
+# and dispatch to the appropriate lifecycle function.
 main() {
-    # Extract command and shift arguments
-    local command=${1:-}
-    [ -n "$command" ] && shift
+    local command="${1:-}"
+    [[ -n "$command" ]] && shift
 
-    # Load default configuration
     load_config || return $?
 
-    # Check required tools (except for help/version commands)
-    if [[ "$command" != "help" && "$command" != "version" && "$command" != "--help" && "$command" != "-h" ]]; then
+    if [[ "$command" != "help" && "$command" != "version" \
+       && "$command" != "--help" && "$command" != "-h" ]]; then
         check_required_tools || return $?
     fi
 
-    # Process command-line options
     parse_options "$@" || return $?
 
-    # Execute specified command
     case "$command" in
-        init)
-            init_sql
-            ;;
-        start)
-            start_server
-            ;;
-        stop)
-            stop_server
-            ;;
-        restart)
-            restart_server
-            ;;
-        status)
-            check_status
-            ;;
-        config)
-            show_config
-            ;;
-        connect)
-            connect_sql
-            ;;
-        logs)
-            show_logs
-            ;;
-        reset-auth)
-            reset_auth
-            ;;
-        version)
-            show_version
-            ;;
-        help | --help | -h)
-            usage
-            ;;
+        init)       init_sql      ;;
+        start)      start_server  ;;
+        stop)       stop_server   ;;
+        restart)    restart_server ;;
+        status)     check_status  ;;
+        logs)       show_logs     ;;
+        reset-auth) reset_auth    ;;
+        version)    show_version  ;;
+        help|--help|-h) usage     ;;
         "")
             usage
             return 1
             ;;
         *)
-            log_message "ERROR" "Unknown command: $command"
+            log_message "ERROR" "Unknown command: '$command'"
             usage
             return 1
             ;;
     esac
-
-    # Return command execution status
-    return $?
 }
 
-# Execute main function with all arguments
 main "$@"
 exit $?

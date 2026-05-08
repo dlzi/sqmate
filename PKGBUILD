@@ -25,13 +25,6 @@ package() {
     install -d "$pkgdir/usr/share/doc/sqmate"
     install -Dm644 README.md "$pkgdir/usr/share/doc/sqmate/"
     install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/sqmate/"
-
-    # Install license
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-
-    # Install man page
     install -Dm644 docs/man/sqmate.1 "$pkgdir/usr/share/man/man1/sqmate.1"
-    
-    # Install bash completion
-    install -Dm644 completion/bash/sqmate "$pkgdir/usr/share/bash-completion/completions/sqmate"
 }

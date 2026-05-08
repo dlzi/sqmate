@@ -8,7 +8,6 @@ PREFIX="${PREFIX:-/usr/local}"
 BINDIR="${BINDIR:-$PREFIX/bin}"
 DOCDIR="${DOCDIR:-$PREFIX/share/doc/sqmate}"
 MANDIR="${MANDIR:-$PREFIX/share/man/man1}"
-COMPLETIONDIR="${COMPLETIONDIR:-$PREFIX/share/bash-completion/completions}"
 CONFIG_DIR="${HOME}/.config/sqmate"
 
 # Confirm uninstallation
@@ -17,7 +16,6 @@ echo "This will remove SQmate from:"
 echo "  Binary:      $BINDIR"
 echo "  Docs:        $DOCDIR"
 echo "  Man Page:    $MANDIR"
-echo "  Completion:  $COMPLETIONDIR"
 echo ""
 read -r -p "Are you sure you want to uninstall SQmate? (y/N): " confirm
 [[ $confirm =~ ^[Yy]$ ]] || {
@@ -36,10 +34,6 @@ echo "Removing documentation..."
 # Remove man page
 echo "Removing man page..."
 [ -f "$MANDIR/sqmate.1" ] && rm -f "$MANDIR/sqmate.1" || echo "Man page not found at $MANDIR/sqmate.1, skipping."
-
-# Remove bash completion
-echo "Removing bash completion..."
-[ -f "$COMPLETIONDIR/sqmate" ] && rm -f "$COMPLETIONDIR/sqmate" || echo "Bash completion not found at $COMPLETIONDIR/sqmate, skipping."
 
 # Optional cleanup of configuration directory
 if [ -d "$CONFIG_DIR" ]; then
