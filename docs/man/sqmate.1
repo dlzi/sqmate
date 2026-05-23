@@ -1,6 +1,6 @@
 .\" Man page for SQMATE
-.\" Generated for SQMATE 1.0.0
-.TH SQMATE 1 "July 13, 2025" "SQMATE 1.0.0" "User Commands"
+.\" Generated for SQMATE 1.2.0
+.TH SQMATE 1 "May 23, 2026" "SQMATE 1.2.0" "User Commands"
 .SH NAME
 sqmate \- Universal SQL Server Manager for MySQL and MariaDB portable installations
 .SH SYNOPSIS
@@ -16,13 +16,7 @@ sqmate \- Universal SQL Server Manager for MySQL and MariaDB portable installati
 .B SQMATE
 is a lightweight command-line utility that simplifies management of portable MySQL and MariaDB installations for local development. It automatically detects your database engine and streamlines server startup, configuration, and monitoring with sensible defaults and multiple profile support.
 .PP
-SQMATE requires Bash 4.0 or higher and a portable MySQL or MariaDB installation. Logging verbosity can be controlled by setting the
-.B LOG_LEVEL
-environment variable to one of DEBUG, INFO, WARNING, or ERROR (default: INFO). The
-.B \-\-debug
-option is a convenience that sets
-.B LOG_LEVEL=DEBUG
-for a single command.
+SQMATE requires Bash 4.3 or higher and a portable MySQL or MariaDB installation.
 .SH COMMANDS
 .TP
 .B init
@@ -31,7 +25,11 @@ for a single command.
 .I OPTIONS
 ]
 .br
-Initialize database data directory and set installation path. Prompts for the MySQL/MariaDB installation directory and automatically detects the engine type.
+Initialize database data directory and set installation path. Prompts for the MySQL/MariaDB installation directory and automatically detects the engine type. Detects and caches
+.B \-\-daemonize
+support so subsequent
+.B start
+calls do not need to spawn the binary to check.
 .RS
 .TP
 .B \-\-sql-dir=PATH
@@ -39,9 +37,6 @@ Set MySQL/MariaDB installation directory.
 .TP
 .B \-\-profile=NAME
 Use specific configuration profile (default: default).
-.TP
-.B \-\-debug
-Enable debug logging (sets LOG_LEVEL=DEBUG).
 .RE
 .TP
 .B start
@@ -64,9 +59,6 @@ Set database port (default: 3306).
 .TP
 .B \-\-profile=NAME
 Use specific configuration profile (default: default).
-.TP
-.B \-\-debug
-Enable debug logging (sets LOG_LEVEL=DEBUG).
 .RE
 .TP
 .B stop
@@ -80,9 +72,6 @@ Stop the running database server.
 .TP
 .B \-\-profile=NAME
 Use specific configuration profile (default: default).
-.TP
-.B \-\-debug
-Enable debug logging (sets LOG_LEVEL=DEBUG).
 .RE
 .TP
 .B restart
@@ -112,25 +101,6 @@ Show server status including uptime and process information.
 .TP
 .B \-\-profile=NAME
 Use specific configuration profile (default: default).
-.TP
-.B \-\-debug
-Enable debug logging (sets LOG_LEVEL=DEBUG).
-.RE
-.TP
-.B connect
-.B sqmate connect
-[
-.I OPTIONS
-]
-.br
-Connect to the database server using the MySQL client.
-.RS
-.TP
-.B \-\-profile=NAME
-Use specific configuration profile (default: default).
-.TP
-.B \-\-debug
-Enable debug logging (sets LOG_LEVEL=DEBUG).
 .RE
 .TP
 .B logs
@@ -139,30 +109,25 @@ Enable debug logging (sets LOG_LEVEL=DEBUG).
 .I OPTIONS
 ]
 .br
-Show recent database error logs.
+Show the last 20 lines of the engine error log.
 .RS
 .TP
 .B \-\-profile=NAME
 Use specific configuration profile (default: default).
-.TP
-.B \-\-debug
-Enable debug logging (sets LOG_LEVEL=DEBUG).
 .RE
 .TP
-.B config
-.B sqmate config
+.B reset-auth
+.B sqmate reset-auth
 [
 .I OPTIONS
 ]
 .br
-Show current configuration.
+Reset root authentication. Starts the server in skip-grant-tables mode,
+clears the root password, and restores native password authentication.
 .RS
 .TP
 .B \-\-profile=NAME
 Use specific configuration profile (default: default).
-.TP
-.B \-\-debug
-Enable debug logging (sets LOG_LEVEL=DEBUG).
 .RE
 .TP
 .B help
@@ -205,9 +170,11 @@ Check server status:
 .EX
 sqmate status
 .EE
-Connect to the database:
+Reset authentication and reconnect:
 .EX
-sqmate connect
+sqmate reset-auth
+sqmate start
+mysql -u root -S /tmp/sqmate_default_3306.sock
 .EE
 View recent error logs:
 .EX
@@ -216,10 +183,6 @@ sqmate logs
 Stop the server:
 .EX
 sqmate stop
-.EE
-Show current configuration:
-.EX
-sqmate config
 .EE
 Show version information:
 .EX
@@ -274,9 +237,6 @@ Invalid command-line option
 .TP
 .B SQMATE_CONFIG_DIR
 Override default configuration directory (~/.config/sqmate).
-.TP
-.B LOG_LEVEL
-Set logging verbosity (DEBUG, INFO, WARNING, ERROR; default: INFO).
 .SH SECURITY CONSIDERATIONS
 .IP \(bu 2
 By default, servers bind to localhost only for security.
@@ -314,9 +274,7 @@ to clean up.
 Check if the server is running with
 .B sqmate status
 .PP
-For detailed troubleshooting, enable debug logging with
-.B \-\-debug
-and check the error logs with
+For detailed troubleshooting check the error logs with
 .B sqmate logs
 .SH AUTHOR
 Based on the design patterns of PHMATE by Daniel Zilli

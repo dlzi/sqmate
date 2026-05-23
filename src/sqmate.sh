@@ -1,56 +1,13 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# sqmate — Universal SQL Server Manager
-# ==============================================================================
+# sqmate — Universal SQL Server Manager (Linux)
 #
-# Manages portable MySQL and MariaDB installations for local development.
-# Supports multiple concurrent profiles (each with its own port, socket, and
-# config), auto-detects engine type, and handles process lifecycle safely.
+# Manages portable MySQL/MariaDB installations with profile support, port
+# management, and process-lifecycle tracking. Run `sqmate help` for usage.
 #
-# Usage:
-#   sqmate <command> [options] [<host>:<port>]
-#
-# Commands:
-#   init        Initialise data directory and save installation path
-#   start       Start the SQL server          (default: localhost:3306)
-#   stop        Stop the running server
-#   restart     Restart the server
-#   status      Show server status
-#   logs        Tail the engine error log
-#   reset-auth  Reset root authentication (fixes broken-login situations)
-#   version     Print version information
-#   help        Print this help text
-#
-# Options:
-#   --sql-dir=<path>   Path to the MySQL/MariaDB installation directory
-#   --profile=<name>   Named configuration profile (default: "default")
-#   --host=<addr>      Bind address              (default: localhost)
-#   --port=<n>         TCP port                  (default: 3306)
-#
-# Examples:
-#   sqmate init --sql-dir=/opt/mariadb-11.4
-#   sqmate start
-#   sqmate start --port=3307 --profile=mariadb11
-#   sqmate start --profile=mysql8 --port=3308
-#   sqmate stop   --profile=mysql8
-#
-# Profile workflow (two engines side-by-side):
-#   sqmate init  --profile=mysql8    --sql-dir=/opt/mysql-8.0.39
-#   sqmate start --profile=mysql8    --port=3306
-#   sqmate init  --profile=mariadb11 --sql-dir=/opt/mariadb-11.4
-#   sqmate start --profile=mariadb11 --port=3307
-#
-# Environment:
-#   SQMATE_CONFIG_DIR   Override config directory (default: ~/.config/sqmate)
-#
-# Supported engines:
-#   MySQL   5.7, 8.0, 8.1+
-#   MariaDB 10.3, 10.4, 10.5, 10.6, 10.11, 11.x+
-#
-# Author:  Daniel Zilli
-# Version: 1.2.0
-# License: Copyright (C) 2025 Daniel Zilli. All rights reserved.
-# ==============================================================================
+# Author:    Daniel Zilli
+# Copyright: (c) 2026 Daniel Zilli
+# License:   MIT
+# Requires:  bash 4.3+
 
 # Abort on unset variables, unhandled errors, and pipeline failures.
 set -euo pipefail
@@ -65,18 +22,28 @@ readonly VERSION="1.2.0"
 SQL_HOST="localhost"
 SQL_PORT="3306"
 SQL_DIR=""
-SQL_ENGINE=""   # "mysql" or "mariadb"; populated by detect_sql_engine
-SQL_BIN=""      # Absolute path to mysqld / mariadbd binary
+SQL_ENGINE=""           # "mysql" or "mariadb"; populated by detect_sql_engine
+SQL_BIN=""              # Absolute path to mysqld / mariadbd binary
+SUPPORTS_DAEMONIZE=""   # "yes" or "no"; detected during init, cached in config
 
 PROFILE="default"
 CONFIG_DIR="${SQMATE_CONFIG_DIR:-${HOME}/.config/sqmate}"
 
-# File paths are re-derived whenever PROFILE or SQL_PORT change.
-CONFIG_FILE="${CONFIG_DIR}/config_${PROFILE}"
-PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.pid"
-SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}_${SQL_PORT}.server.pid"
-LOGFILE="${CONFIG_DIR}/sqmate_${PROFILE}.log"
-SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
+# _derive_paths — re-compute every path that embeds PROFILE or SQL_PORT.
+# Defined here (before first use) so it can be called at top level and from
+# any function without forward-reference issues.
+_derive_paths() {
+    CONFIG_FILE="${CONFIG_DIR}/config_${PROFILE}"
+    PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.pid"
+    SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}_${SQL_PORT}.server.pid"
+    LOGFILE="${CONFIG_DIR}/sqmate_${PROFILE}.log"
+    SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
+}
+_derive_paths   # Set initial values from the defaults above.
+
+# Flipped to 1 by _pidfile_create; prevents _cleanup_on_exit from wiping a
+# PID file this invocation never created (e.g. during status or logs).
+_SQMATE_CREATED_PIDFILE=0
 
 # ANSI colours — defined once, referenced by log_message.
 declare -r COLOR_INFO='\033[0;34m'
@@ -180,7 +147,7 @@ show_version() {
 #
 #   $1  hostport  — one of:  host:port | :port | host | port | [IPv6]:port
 #
-# Updates the global SQL_HOST / SQL_PORT variables and re-derives SOCKET_FILE.
+# Updates the global SQL_HOST / SQL_PORT variables and re-derives all paths.
 parse_hostport() {
     local hostport_arg="$1"
 
@@ -207,11 +174,11 @@ parse_hostport() {
         log_message "ERROR" "IPv6 addresses must use bracket notation: [::1]:3306"
         return 1
     else
-        log_message "WARNING" "Cannot parse '$hostport_arg' as host:port — using defaults ($SQL_HOST:$SQL_PORT)"
+        log_message "ERROR" "Cannot parse '$hostport_arg' as host:port"
+        return 1
     fi
 
-    # Re-derive the socket path now that port is resolved.
-    SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
+    _derive_paths
 }
 
 # parse_options — process all named options and the optional positional argument.
@@ -228,11 +195,7 @@ parse_options() {
                 ;;
             --profile=*)
                 PROFILE="${arg#*=}"
-                CONFIG_FILE="${CONFIG_DIR}/config_${PROFILE}"
-                PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.pid"
-                SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}_${SQL_PORT}.server.pid"
-                LOGFILE="${CONFIG_DIR}/sqmate_${PROFILE}.log"
-                SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
+                _derive_paths
                 ;;
             --host=*)
                 SQL_HOST="${arg#*=}"
@@ -241,8 +204,7 @@ parse_options() {
             --port=*)
                 SQL_PORT="${arg#*=}"
                 validate_port "$SQL_PORT" || return 1
-                SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
-                SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}_${SQL_PORT}.server.pid"
+                _derive_paths
                 ;;
             -*)
                 log_message "ERROR" "Unknown option: $arg"
@@ -283,9 +245,8 @@ validate_path() {
 # validate_hostname — reject strings that cannot be valid hostnames or IP addresses.
 validate_hostname() {
     local hostname="$1"
-    if [[ "$hostname" =~ ^[a-zA-Z0-9.-]+$               # hostname / IPv4
-       || "$hostname" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$  # strict IPv4 (extra check)
-       || "$hostname" =~ ^\[[0-9a-fA-F:]+\]$             # [IPv6]
+    if [[ "$hostname" =~ ^[a-zA-Z0-9.-]+$    # hostname / IPv4
+       || "$hostname" =~ ^\[[0-9a-fA-F:]+\]$  # [IPv6]
     ]]; then
         return 0
     fi
@@ -371,17 +332,12 @@ check_port_available() {
     fi
 }
 
-# check_required_tools — abort early if a core POSIX utility is missing.
+# check_required_tools — abort early if a tool sqmate genuinely depends on is missing.
+# ps and kill are guaranteed on any Linux system; realpath (GNU coreutils, used
+# with the -m flag) is the only tool worth guarding here.
 check_required_tools() {
-    local -a missing=()
-    local tool
-
-    for tool in ps kill realpath; do
-        command -v "$tool" &>/dev/null || missing+=("$tool")
-    done
-
-    if (( ${#missing[@]} > 0 )); then
-        log_message "ERROR" "Missing required tools: ${missing[*]}"
+    if ! command -v realpath &>/dev/null; then
+        log_message "ERROR" "Missing required tool: realpath (install GNU coreutils)"
         return 1
     fi
 
@@ -423,11 +379,9 @@ load_config() {
 
     CONFIG_FILE="$cfg"
 
-    # Re-derive path variables that embed SQL_PORT (which may have just changed).
-    PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}.pid"
-    SERVER_PIDFILE="${CONFIG_DIR}/sqmate_${PROFILE}_${SQL_PORT}.server.pid"
-    LOGFILE="${CONFIG_DIR}/sqmate_${PROFILE}.log"
-    SOCKET_FILE="/tmp/sqmate_${PROFILE}_${SQL_PORT}.sock"
+    # Re-derive paths now that SQL_PORT (and other vars) may have been loaded
+    # from the config file.
+    _derive_paths
 }
 
 # save_config — write the current runtime state to the profile config file.
@@ -448,6 +402,7 @@ SQL_PORT="${SQL_PORT}"
 SQL_DIR="${abs_sql_dir}"
 SQL_ENGINE="${SQL_ENGINE}"
 SOCKET_FILE="${SOCKET_FILE}"
+SUPPORTS_DAEMONIZE="${SUPPORTS_DAEMONIZE}"
 EOF
     then
         log_message "ERROR" "Failed to write config file: $CONFIG_FILE"
@@ -480,6 +435,7 @@ EOF
     fi
 
     chmod 600 "$PIDFILE" 2>/dev/null || log_message "WARNING" "Cannot set permissions on: $PIDFILE"
+    _SQMATE_CREATED_PIDFILE=1
 }
 
 # _pidfile_read — read and validate the tracking PID file.
@@ -505,10 +461,10 @@ _pidfile_get() {
     local key="$1"
     local data
     data=$(_pidfile_read) || return 1
-    
+
     local line
     line=$(grep "^${key}=" <<< "$data" 2>/dev/null) || return 1
-    
+
     # Pure bash parameter expansion instead of subshell cut
     printf '%s\n' "${line#*=}"
 }
@@ -520,7 +476,7 @@ _pidfile_check() {
 
     line=$(grep '^PID=' <<< "$data")
     server_pid="${line#*=}"
-    
+
     line=$(grep '^SQL_PORT=' <<< "$data")
     port="${line#*=}"
 
@@ -551,14 +507,17 @@ _pidfile_check() {
 cleanup_pid_files() {
     local profile="${1:-$PROFILE}"
 
-    rm -f "${CONFIG_DIR}/sqmate_${profile}.pid"        2>/dev/null
+    rm -f "${CONFIG_DIR}/sqmate_${profile}.pid"          2>/dev/null
     rm -f "${CONFIG_DIR}/sqmate_${profile}_"*.server.pid 2>/dev/null
-    rm -f "/tmp/sqmate_${profile}_"*.sock              2>/dev/null
+    rm -f "/tmp/sqmate_${profile}_"*.sock                2>/dev/null
 }
 
-# _cleanup_on_exit — trap handler: clean up PID files on SIGINT / SIGTERM.
+# _cleanup_on_exit — trap handler: clean up PID files on SIGINT / SIGTERM,
+# but only when this invocation created them.  Read-only commands (status,
+# logs, …) never set _SQMATE_CREATED_PIDFILE, so their Ctrl-C cannot corrupt
+# the tracking state of a server started by a prior invocation.
 _cleanup_on_exit() {
-    cleanup_pid_files "$PROFILE" 2>/dev/null || true
+    (( _SQMATE_CREATED_PIDFILE )) && cleanup_pid_files "$PROFILE" 2>/dev/null || true
 }
 trap '_cleanup_on_exit; exit 1' INT TERM
 
@@ -579,9 +538,12 @@ find_port_processes() {
             [[ -n "$pid" ]] && pids+=("$pid")
         done < <(lsof -i :"$port" -sTCP:LISTEN -t 2>/dev/null)
     elif command -v ss &>/dev/null; then
+        # -p requires no special privilege when the processes are owned by the
+        # current user.  'pid=NNN' appears in the users:() column; extract it
+        # with a literal-string grep so no regex metacharacters can surprise us.
         while IFS= read -r pid; do
             [[ -n "$pid" ]] && pids+=("$pid")
-        done < <(ss -tuln | grep -w "$port" | awk '{print $NF}' | grep -o '[0-9]\+' | sort -u)
+        done < <(ss -tulnp | grep -w "$port" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u)
     fi
 
     echo "${pids[@]:-}"
@@ -637,7 +599,7 @@ initialize_data_directory() {
 
         if [[ -f "$install_db" && -x "$install_db" ]]; then
             log_message "INFO" "Using mysql_install_db script."
-            "$install_db" --datadir="$data_dir" --basedir="$SQL_DIR" --user="$(whoami)" || {
+            "$install_db" --datadir="$data_dir" --basedir="$SQL_DIR" --user="$USER" || {
                 log_message "WARNING" "mysql_install_db failed; falling back to --initialize-insecure."
                 "$SQL_BIN" --initialize-insecure --datadir="$data_dir" --basedir="$SQL_DIR" || {
                     log_message "ERROR" "Both MariaDB initialisation methods failed."
@@ -680,6 +642,14 @@ init_sql() {
 
     validate_sql || return 1
     log_message "SUCCESS" "Detected ${SQL_ENGINE^} installation."
+
+    # Detect --daemonize support once and cache it so start_server never needs
+    # to spawn the binary on every invocation just to check a flag.
+    if "$SQL_BIN" --help --verbose 2>/dev/null | grep -q -- '--daemonize'; then
+        SUPPORTS_DAEMONIZE="yes"
+    else
+        SUPPORTS_DAEMONIZE="no"
+    fi
 
     local data_dir="${SQL_DIR}/data"
     local logs_dir="${SQL_DIR}/logs"
@@ -729,12 +699,19 @@ start_server() {
         return 1
     fi
 
+    # Use the cached SUPPORTS_DAEMONIZE value from config (written during init).
+    # Fall back to runtime detection for configs written before 1.2.0 that do
+    # not yet have this field.
     local daemon_flag=""
-    if "$SQL_BIN" --help --verbose 2>/dev/null | grep -q -- '--daemonize'; then
+    if [[ "$SUPPORTS_DAEMONIZE" == "yes" ]]; then
         daemon_flag="--daemonize"
-    else
-        log_message "INFO" "Engine does not support --daemonize; starting in background."
+    elif [[ "$SUPPORTS_DAEMONIZE" != "no" ]]; then
+        # Not yet cached — detect at runtime (pre-1.2.0 config).
+        if "$SQL_BIN" --help --verbose 2>/dev/null | grep -q -- '--daemonize'; then
+            daemon_flag="--daemonize"
+        fi
     fi
+    [[ -z "$daemon_flag" ]] && log_message "INFO" "Engine does not support --daemonize; starting in background."
 
     local base_args=(
         --datadir="$data_dir"
@@ -851,26 +828,47 @@ stop_server() {
 
     local failed=0
 
-    if ! kill -0 "$server_pid" 2>/dev/null; then
-        log_message "WARNING" "Process $server_pid already gone."
+    # server_pid may contain multiple space-separated PIDs when obtained from
+    # find_port_processes (the PID-file-absent fallback path).  All signal
+    # operations iterate over the set individually.
+    local pid any_alive=0
+    for pid in $server_pid; do
+        kill -0 "$pid" 2>/dev/null && { any_alive=1; break; }
+    done
+
+    if (( any_alive == 0 )); then
+        log_message "WARNING" "Process(es) $server_pid already gone."
     else
         log_message "INFO" "Stopping ${sql_engine^} (PID: ${server_pid}) on ${sql_host}:${sql_port}…"
 
-        kill -TERM "$server_pid" 2>/dev/null \
-            || log_message "WARNING" "SIGTERM delivery failed for PID $server_pid."
+        for pid in $server_pid; do
+            kill -TERM "$pid" 2>/dev/null \
+                || log_message "WARNING" "SIGTERM delivery failed for PID $pid."
+        done
 
-        local attempt=0
-        while (( attempt < 30 )) && kill -0 "$server_pid" 2>/dev/null; do
+        local attempt=0 still_running=1
+        while (( attempt < 30 )); do
+            still_running=0
+            for pid in $server_pid; do
+                kill -0 "$pid" 2>/dev/null && { still_running=1; break; }
+            done
+            (( still_running == 0 )) && break
             sleep 1
             (( ++attempt ))
         done
 
-        if kill -0 "$server_pid" 2>/dev/null; then
+        if (( still_running == 1 )); then
             log_message "WARNING" "Graceful shutdown timed out; sending SIGKILL to $server_pid."
-            kill -9 "$server_pid" 2>/dev/null
+            for pid in $server_pid; do
+                kill -9 "$pid" 2>/dev/null
+            done
             sleep 2
-            if kill -0 "$server_pid" 2>/dev/null; then
-                log_message "ERROR" "Cannot terminate process $server_pid."
+            still_running=0
+            for pid in $server_pid; do
+                kill -0 "$pid" 2>/dev/null && { still_running=1; break; }
+            done
+            if (( still_running == 1 )); then
+                log_message "ERROR" "Cannot terminate process(es) $server_pid."
                 failed=1
             fi
         fi
@@ -907,29 +905,29 @@ check_status() {
         return 1
     fi
 
-    local pid host port dir engine data_dir socket profile start_time
+    # Read the PID file once into an associative array.  Using parameter
+    # expansion (%%=* / #*=) to split on the first '=' correctly handles
+    # values that contain '=' characters (e.g. paths with = in directory names).
+    local -A info=()
+    local line
+    while IFS= read -r line; do
+        [[ "$line" == *=* ]] || continue
+        info["${line%%=*}"]="${line#*=}"
+    done < "$PIDFILE"
 
-    pid=$(      _pidfile_get "PID")
-    host=$(     _pidfile_get "SQL_HOST")
-    port=$(     _pidfile_get "SQL_PORT")
-    dir=$(      _pidfile_get "SQL_DIR")
-    engine=$(   _pidfile_get "SQL_ENGINE")
-    data_dir=$( _pidfile_get "DATA_DIR")
-    socket=$(   _pidfile_get "SOCKET_FILE")
-    profile=$(  _pidfile_get "PROFILE")
-
-    printf "Server Status (%s):\n" "${profile:-default}"
+    printf "Server Status (%s):\n" "${info[PROFILE]:-default}"
     printf "  %-18s %s\n" "Status:"         "Running"
-    printf "  %-18s %s\n" "Engine:"         "${engine^}"
-    printf "  %-18s %s\n" "PID:"            "$pid"
-    printf "  %-18s %s\n" "URL:"            "${engine}://${host}:${port}/"
-    printf "  %-18s %s\n" "Socket File:"    "$socket"
-    printf "  %-18s %s\n" "SQL Directory:"  "$dir"
-    printf "  %-18s %s\n" "Data Directory:" "$data_dir"
+    printf "  %-18s %s\n" "Engine:"         "${info[SQL_ENGINE]^}"
+    printf "  %-18s %s\n" "PID:"            "${info[PID]}"
+    printf "  %-18s %s\n" "URL:"            "${info[SQL_ENGINE]}://${info[SQL_HOST]}:${info[SQL_PORT]}/"
+    printf "  %-18s %s\n" "Socket File:"    "${info[SOCKET_FILE]}"
+    printf "  %-18s %s\n" "SQL Directory:"  "${info[SQL_DIR]}"
+    printf "  %-18s %s\n" "Data Directory:" "${info[DATA_DIR]}"
     printf "  %-18s %s\n" "Log File:"       "$LOGFILE"
 
     if command -v ps &>/dev/null; then
-        start_time=$(ps -o lstart= -p "$pid" 2>/dev/null)
+        local start_time
+        start_time=$(ps -o lstart= -p "${info[PID]}" 2>/dev/null)
         [[ -n "$start_time" ]] \
             && printf "  %-18s %s\n" "Started:" "$start_time"
     fi
@@ -952,6 +950,15 @@ restart_server() {
         [[ -n "$s_dir"     ]] && SQL_DIR="$s_dir"
         [[ -n "$s_engine"  ]] && SQL_ENGINE="$s_engine"
         [[ -n "$s_profile" ]] && PROFILE="$s_profile"
+
+        # Re-derive paths now that the restored values are in place.
+        # load_config and parse_options both ran before the tracking PID file
+        # was consulted, so their derived paths may embed a stale port (e.g.
+        # the config-file default) rather than the port the server was actually
+        # started on.  Without this, start_server would launch the new server
+        # with a misnamed socket and server-PID file, breaking socket
+        # connections and corrupting the tracking state.
+        _derive_paths
 
         log_message "INFO" "Restoring: engine=${SQL_ENGINE^}  dir=$SQL_DIR  addr=${SQL_HOST}:${SQL_PORT}"
     else
@@ -1057,8 +1064,9 @@ FLUSH PRIVILEGES;"
 
     if (( reset_rc == 0 )); then
         log_message "SUCCESS" "Root authentication reset — no password, native plugin."
-        log_message "INFO" "Next steps:"
-        printf "  sqmate start\n  sqmate connect\n"
+        log_message "INFO" "Start the server and connect:"
+        printf "  sqmate start\n"
+        printf "  mysql -u root -S %s\n" "$SOCKET_FILE"
     else
         log_message "ERROR" "Authentication reset failed (SQL client returned $reset_rc)."
         return 1
@@ -1067,6 +1075,11 @@ FLUSH PRIVILEGES;"
 
 # show_logs — tail the engine error log (last 20 lines).
 show_logs() {
+    if [[ -z "$SQL_DIR" ]]; then
+        log_message "ERROR" "SQL directory not configured. Run 'sqmate init' first."
+        return 1
+    fi
+
     local error_log="${SQL_DIR}/logs/mysqld_error.log"
     local engine_label="${SQL_ENGINE^}"
 
@@ -1090,6 +1103,19 @@ show_logs() {
 main() {
     local command="${1:-}"
     [[ -n "$command" ]] && shift
+
+    # Pre-scan for --profile so load_config sources the correct profile's
+    # config file.  parse_options runs after load_config, so without this
+    # the profile flag would be seen too late and the saved SQL_DIR (and
+    # all other per-profile settings) would never be applied.
+    local arg
+    for arg in "$@"; do
+        if [[ "$arg" == --profile=* ]]; then
+            PROFILE="${arg#*=}"
+            _derive_paths
+            break
+        fi
+    done
 
     load_config || return $?
 

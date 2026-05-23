@@ -17,13 +17,13 @@ Sqmate is a lightweight command-line utility that simplifies management of porta
 - **Socket Connection**: Secure local connections via Unix domain sockets
 - **GUI Tool Compatible**: Works with database management tools like Navicat, phpMyAdmin, etc.
 - **Robust Error Handling**: Comprehensive error checking, validation, and detailed logs
-- **Logging**: Detailed logs with configurable verbosity levels (DEBUG, INFO, WARNING, ERROR)
+- **Logging**: Detailed operation logs written to `~/.config/sqmate/sqmate_<profile>.log`
 - **Status Monitoring**: View running server status including uptime and process information
 - **Multiple Instances**: Run multiple database servers simultaneously on different ports
 
 ## Requirements
 
-- **Bash**: Version 4.0 or higher
+- **Bash**: Version 4.3 or higher
 - **MySQL or MariaDB**: Portable installation (any recent version)
 - **Standard Unix Tools**: ps, kill, realpath (required), ss/lsof (optional for port checking)
 - **Critical Dependency**: `libxcrypt.so.1` library (see Compatibility Notes below)
@@ -32,7 +32,7 @@ Sqmate is a lightweight command-line utility that simplifies management of porta
 
 ### Using Makefile
 
-If you've cloned the repository, you can use the provided Makefile for a complete installation including documentation and bash completion:
+If you've cloned the repository, you can use the provided Makefile for a complete installation including documentation and the man page:
 
 ```bash
 git clone https://github.com/dlzi/sqmate.git
@@ -56,7 +56,7 @@ make uninstall       # If installed to ~/.local
 
 ### Using install.sh Script
 
-The repository includes an installation script that properly installs all components including documentation and bash completion:
+The repository includes an installation script that installs all components including documentation and the man page:
 
 ```bash
 git clone https://github.com/dlzi/sqmate.git
@@ -153,9 +153,6 @@ sqmate start
 
 # Check status
 sqmate status
-
-# Connect to your database
-sqmate connect
 ```
 
 That's it! Your database server is now running.
@@ -172,12 +169,10 @@ sqmate restart            # Restart the server
 sqmate status             # Check server status
 
 # Database operations
-sqmate connect            # Connect to the database
 sqmate logs               # View recent error logs
 sqmate reset-auth         # Fix authentication issues
 
 # Configuration
-sqmate config             # Show current configuration
 sqmate init               # Initialize new database
 ```
 
@@ -192,10 +187,8 @@ sqmate init               # Initialize new database
 | `stop` | Stop the running server |
 | `restart` | Restart the server |
 | `status` | Show server status |
-| `connect` | Connect to database server |
 | `logs` | Show recent error logs |
 | `reset-auth` | Reset database authentication (fixes login issues) |
-| `config` | Show current configuration |
 | `version` | Show version information |
 | `help` | Display help information |
 
@@ -204,10 +197,9 @@ sqmate init               # Initialize new database
 | Option | Description |
 |--------|-------------|
 | `--sql-dir=<path>` | Set MySQL/MariaDB installation directory |
-| `--profile=<n>` | Use specific configuration profile (auto-created on first use) |
+| `--profile=<name>` | Named configuration profile; must be initialised with `sqmate init --profile=<name>` before use |
 | `--host=<hostname>` | Set database hostname (default: localhost) |
 | `--port=<number>` | Set database port (default: 3306) |
-| `--debug` | Enable debug logging |
 
 ### Examples
 
@@ -216,7 +208,6 @@ sqmate init               # Initialize new database
 sqmate init                                     # Initialize default profile
 sqmate start                                    # Start server
 sqmate status                                   # Check it's running
-sqmate connect                                  # Connect to database
 
 # Fix authentication issues
 sqmate reset-auth   # Fixes most login problems
@@ -269,7 +260,10 @@ Connection Type: TCP/IP (not socket)
 
 3. **Test command-line connection**:
    ```bash
-   sqmate connect
+   # Connect via socket (path shown by sqmate status)
+   mysql -u root -S /tmp/sqmate_default_3306.sock
+   # or via TCP
+   mysql -u root -h 127.0.0.1 -P 3306
    ```
 
 4. **Check TCP connectivity**:
@@ -293,7 +287,7 @@ All configuration files are stored in `~/.config/sqmate/`:
 
 | File Type | Location | Description |
 |-----------|----------|-------------|
-| **Profile Config** | `~/.config/sqmate/config_<profile>` | Stores SQL_DIR, host, port, engine type |
+| **Profile Config** | `~/.config/sqmate/config_<profile>` | Stores SQL_DIR, host, port, engine type, daemonize support |
 | **Sqmate PID** | `~/.config/sqmate/sqmate_<profile>.pid` | Tracks sqmate's view of server state |
 | **Server PID** | `~/.config/sqmate/sqmate_<profile>_<port>.server.pid` | Actual database server PID |
 | **Sqmate Logs** | `~/.config/sqmate/sqmate_<profile>.log` | Sqmate operation logs |
@@ -318,7 +312,6 @@ Sqmate uses profiles to manage multiple database configurations:
 | Variable | Description |
 |----------|-------------|
 | `SQMATE_CONFIG_DIR` | Override default config directory (~/.config/sqmate) |
-| `LOG_LEVEL` | Set logging verbosity (DEBUG, INFO, WARNING, ERROR) |
 
 ## Database-Specific Notes
 
@@ -371,7 +364,6 @@ If you can't connect to your database or get "Access denied" errors:
 sqmate stop
 sqmate reset-auth
 sqmate start
-sqmate connect  # Should work without password (MariaDB) or with temp password (MySQL)
 ```
 
 The `reset-auth` command:
@@ -388,25 +380,24 @@ The `reset-auth` command:
    sqmate status
    ```
 
-2. **View Sqmate operation logs**:
+2. **View engine error log**:
    ```bash
    sqmate logs
    ```
 
-3. **View detailed database error logs**:
+3. **View sqmate operational log**:
    ```bash
    tail -f ~/.config/sqmate/sqmate_<profile>.log
+   ```
+
+4. **View engine error log directly** (for verbose output):
+   ```bash
    tail -f <sql-dir>/logs/mysqld_error.log
    ```
 
-4. **Enable debug logging**:
+5. **View current profile configuration**:
    ```bash
-   LOG_LEVEL=DEBUG sqmate start
-   ```
-
-5. **View current configuration**:
-   ```bash
-   sqmate config
+   cat ~/.config/sqmate/config_default
    ```
 
 6. **Check TCP port binding**:
@@ -457,7 +448,6 @@ sqmate init --sql-dir=/path/to/database
 # Daily usage
 sqmate start        # Start server
 sqmate status       # Verify it's running
-sqmate connect      # Connect to database  
 sqmate stop         # Stop server
 
 # Fix authentication issues
@@ -483,7 +473,7 @@ sqmate reset-auth   # Fix authentication
 ## Frequently Asked Questions
 
 **Q: Server won't start, error about libcrypt.so.1?**  
-A: Install `libxcrypt-compat` or `libxcrypt1` package .
+A: Install `libxcrypt-compat` or `libxcrypt1` package.
 
 **Q: Do I need to run sqmate with sudo?**  
 A: No. Sqmate runs as your user. Only installation to `/usr/local/bin` requires sudo.
@@ -492,7 +482,7 @@ A: No. Sqmate runs as your user. Only installation to `/usr/local/bin` requires 
 A: Yes! Use different profiles and ports for each instance.
 
 **Q: How do I change the root password?**  
-A: Connect with `sqmate connect` then run SQL commands to set password.
+A: Connect using the mysql client (socket path shown by `sqmate status`) then run SQL commands to set a password.
 
 **Q: Where are my database files stored?**  
 A: In `<sql-dir>/data/` where `<sql-dir>` is the directory you provided during `init`.

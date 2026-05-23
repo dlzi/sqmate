@@ -1,6 +1,6 @@
-# Contributing to SQmate
+# Contributing to sqmate
 
-Thank you for your interest in contributing to SQmate! This document provides guidelines and instructions for contributing.
+Thank you for your interest in contributing to sqmate! This document provides guidelines and instructions for contributing.
 
 ## Code of Conduct
 
@@ -39,4 +39,4 @@ Please update the documentation when necessary:
 
 ## License
 
-By contributing to SQmate, you agree that your contributions will be licensed under the project's MIT License.
+By contributing to sqmate, you agree that your contributions will be licensed under the project's MIT License.

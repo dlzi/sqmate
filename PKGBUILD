@@ -1,12 +1,12 @@
 # Maintainer: Daniel Zilli
 pkgname=sqmate
-pkgver=1.0.0
+pkgver=1.2.0
 pkgrel=1
 pkgdesc="A lightweight command-line utility that simplifies management of portable MySQL and MariaDB installations for local development."
 arch=('any')
 url="https://github.com/dlzi/sqmate"
 license=('MIT')
-depends=('bash>=4.4' 'libxcrypt-compat')
+depends=('bash>=4.3' 'libxcrypt-compat')
 optdepends=(
     'bash-completion: for command-line completion'
     'mysql: for MySQL database engine support'

@@ -2,7 +2,6 @@
 # Default installation paths
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
-LIBDIR ?= $(PREFIX)/share/sqmate
 DOCDIR ?= $(PREFIX)/share/doc/sqmate
 MANDIR ?= $(PREFIX)/share/man/man1
 
