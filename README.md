@@ -26,7 +26,7 @@ Sqmate is a lightweight command-line utility that simplifies management of porta
 - **Bash**: Version 4.3 or higher
 - **MySQL or MariaDB**: Portable installation (any recent version)
 - **Standard Unix Tools**: ps, kill, realpath (required), ss/lsof (optional for port checking)
-- **Critical Dependency**: `libxcrypt.so.1` library (see Compatibility Notes below)
+- **Critical Dependency**: `libcrypt.so.1` library (see Compatibility Notes below)
 
 ## Installation
 
@@ -80,7 +80,7 @@ PREFIX="$HOME/.local" ./uninstall.sh  # If installed to ~/.local
 
 ## Compatibility Notes
 
-### Critical: libxcrypt.so.1 Required
+### Critical: libcrypt.so.1 Required
 
 **⚠️ IMPORTANT**: Portable MySQL/MariaDB binaries require the `libcrypt.so.1` library. Without this library, the database server will **fail to start** with errors like:
 
@@ -293,7 +293,7 @@ All configuration files are stored in `~/.config/sqmate/`:
 | **Sqmate Logs** | `~/.config/sqmate/sqmate_<profile>.log` | Sqmate operation logs |
 | **Socket File** | `/tmp/sqmate_<profile>_<port>.sock` | Unix domain socket for local connections |
 | **Database Logs** | `<sql-dir>/logs/mysqld_error.log` | Database server error log |
-| **Query Logs** | `<sql-dir>/logs/mysqld_general.log` | Database query log (if enabled) |
+| **Query Logs** | `<sql-dir>/logs/mysqld_general.log` | Database query log, created only when `SQMATE_GENERAL_LOG=1` is set |
 
 ### Profile System
 
@@ -312,6 +312,7 @@ Sqmate uses profiles to manage multiple database configurations:
 | Variable | Description |
 |----------|-------------|
 | `SQMATE_CONFIG_DIR` | Override default config directory (~/.config/sqmate) |
+| `SQMATE_GENERAL_LOG` | Set to `1`, `yes`, `true`, or `on` to enable the database general query log |
 
 ## Database-Specific Notes
 

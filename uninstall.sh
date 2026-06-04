@@ -1,14 +1,14 @@
 #!/bin/bash
 # SQmate Uninstallation Script
 
-set -e
+set -euo pipefail
 
 # Default installation paths
 PREFIX="${PREFIX:-/usr/local}"
 BINDIR="${BINDIR:-$PREFIX/bin}"
 DOCDIR="${DOCDIR:-$PREFIX/share/doc/sqmate}"
 MANDIR="${MANDIR:-$PREFIX/share/man/man1}"
-CONFIG_DIR="${HOME}/.config/sqmate"
+CONFIG_DIR="${SQMATE_CONFIG_DIR:-${HOME}/.config/sqmate}"
 
 # Confirm uninstallation
 echo "=== SQmate Uninstallation ==="

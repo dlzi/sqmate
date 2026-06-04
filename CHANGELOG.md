@@ -2,6 +2,24 @@
 
 All notable changes to SQmate will be documented in this file.
 
+## [1.2.1] - Unreleased
+
+### Fixed
+- Fixed positional `host:port` parsing so numeric ports, `:port`, hostnames, and bracketed IPv6 do not corrupt `BASH_REMATCH` under `set -u`.
+- Added strict profile-name validation to prevent profile path traversal.
+- Replaced shell `source` config loading with a strict key-value parser that does not execute config contents.
+- Made `reset-auth` always clean up the safe-mode server when the SQL reset command fails.
+- Made `restart` abort if `stop` fails.
+- Prevented `stop` from killing unrelated processes that merely listen on the same port.
+- Kept tracking files intact when shutdown fails so the failed server remains inspectable.
+- Disabled general query logging by default; enable it with `SQMATE_GENERAL_LOG=1`.
+- Wrote MySQL initialization errors to the documented error log path.
+
+### Changed
+- Install scripts and Makefile now support both flat release archives and `src/` / `docs/man/` source-tree layouts.
+- Install and uninstall paths are quoted for directories containing spaces.
+- Documentation now consistently names the required compatibility library as `libcrypt.so.1`.
+
 ## [1.2.0] - 23/05/2026
 
 ### Added

@@ -11,26 +11,23 @@ all:
 
 install:
 	@echo "Installing sqmate..."
-	@install -d $(DESTDIR)$(BINDIR)
-	@install -d $(DESTDIR)$(DOCDIR)
-	@install -d $(DESTDIR)$(MANDIR)
-	
-	# Install the script
-	@install -m 755 src/sqmate.sh $(DESTDIR)$(BINDIR)/sqmate
-	
-	# Install documentation
-	@install -m 644 README.md $(DESTDIR)$(DOCDIR)/
-	@install -m 644 CHANGELOG.md $(DESTDIR)$(DOCDIR)/
-	@install -m 644 LICENSE $(DESTDIR)$(DOCDIR)/
-	@install -m 644 docs/man/sqmate.1 $(DESTDIR)$(MANDIR)/
-	
+	@install -d "$(DESTDIR)$(BINDIR)"
+	@install -d "$(DESTDIR)$(DOCDIR)"
+	@install -d "$(DESTDIR)$(MANDIR)"
+	@if [ -f src/sqmate.sh ]; then script=src/sqmate.sh; elif [ -f sqmate.sh ]; then script=sqmate.sh; else echo "Cannot find sqmate.sh" >&2; exit 1; fi; \
+		install -m 755 "$$script" "$(DESTDIR)$(BINDIR)/sqmate"
+	@for doc in README.md CHANGELOG.md LICENSE; do \
+		if [ -f "$$doc" ]; then install -m 644 "$$doc" "$(DESTDIR)$(DOCDIR)/"; fi; \
+	done
+	@if [ -f docs/man/sqmate.1 ]; then manpage=docs/man/sqmate.1; elif [ -f sqmate.1 ]; then manpage=sqmate.1; else manpage=; fi; \
+		if [ -n "$$manpage" ]; then install -m 644 "$$manpage" "$(DESTDIR)$(MANDIR)/sqmate.1"; fi
 	@echo "Installation complete!"
 
 uninstall:
 	@echo "Uninstalling sqmate..."
-	@rm -f $(DESTDIR)$(BINDIR)/sqmate
-	@rm -f $(DESTDIR)$(MANDIR)/sqmate.1
-	@rm -rf $(DESTDIR)$(DOCDIR)
+	@rm -f "$(DESTDIR)$(BINDIR)/sqmate"
+	@rm -f "$(DESTDIR)$(MANDIR)/sqmate.1"
+	@rm -rf "$(DESTDIR)$(DOCDIR)"
 	@echo "Uninstall complete!"
 
 clean:

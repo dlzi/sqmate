@@ -16,7 +16,7 @@ set -euo pipefail
 # CONSTANTS & DEFAULTS
 # ==============================================================================
 
-readonly VERSION="1.2.0"
+readonly VERSION="1.2.1"
 
 # Runtime state — may be overridden by load_config / parse_options.
 SQL_HOST="localhost"
@@ -150,26 +150,35 @@ show_version() {
 # Updates the global SQL_HOST / SQL_PORT variables and re-derives all paths.
 parse_hostport() {
     local hostport_arg="$1"
+    local host port
 
     if [[ "$hostport_arg" =~ ^(\[[0-9a-fA-F:]+\]):([0-9]+)$ ]]; then
-        validate_hostname "${BASH_REMATCH[1]}" || return 1
-        validate_port     "${BASH_REMATCH[2]}" || return 1
-        SQL_HOST="${BASH_REMATCH[1]}"
-        SQL_PORT="${BASH_REMATCH[2]}"
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+        host="${host#[}"
+        host="${host%]}"
+        validate_hostname "$host" || return 1
+        validate_port "$port" || return 1
+        SQL_HOST="$host"
+        SQL_PORT="$port"
     elif [[ "$hostport_arg" =~ ^([^:]+):([0-9]+)$ ]]; then
-        validate_hostname "${BASH_REMATCH[1]}" || return 1
-        validate_port     "${BASH_REMATCH[2]}" || return 1
-        SQL_HOST="${BASH_REMATCH[1]}"
-        SQL_PORT="${BASH_REMATCH[2]}"
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+        validate_hostname "$host" || return 1
+        validate_port "$port" || return 1
+        SQL_HOST="$host"
+        SQL_PORT="$port"
     elif [[ "$hostport_arg" =~ ^:([0-9]+)$ ]]; then
-        validate_port "${BASH_REMATCH[1]}" || return 1
-        SQL_PORT="${BASH_REMATCH[1]}"
-    elif [[ "$hostport_arg" =~ ^([^:]+):?$ ]]; then
-        validate_hostname "${BASH_REMATCH[1]}" || return 1
-        SQL_HOST="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[1]}"
+        validate_port "$port" || return 1
+        SQL_PORT="$port"
     elif [[ "$hostport_arg" =~ ^[0-9]+$ ]]; then
         validate_port "$hostport_arg" || return 1
         SQL_PORT="$hostport_arg"
+    elif [[ "$hostport_arg" =~ ^([^:]+):?$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        validate_hostname "$host" || return 1
+        SQL_HOST="$host"
     elif [[ "$hostport_arg" =~ .*:.* ]]; then
         log_message "ERROR" "IPv6 addresses must use bracket notation: [::1]:3306"
         return 1
@@ -195,6 +204,7 @@ parse_options() {
                 ;;
             --profile=*)
                 PROFILE="${arg#*=}"
+                validate_profile "$PROFILE" || return 1
                 _derive_paths
                 ;;
             --host=*)
@@ -218,7 +228,11 @@ parse_options() {
         shift
     done
 
-    if [[ "${#positional[@]}" -gt 0 ]]; then
+    if [[ "${#positional[@]}" -gt 1 ]]; then
+        log_message "ERROR" "Too many positional arguments: ${positional[*]}"
+        usage
+        return 2
+    elif [[ "${#positional[@]}" -eq 1 ]]; then
         parse_hostport "${positional[0]}" || return 1
     fi
 }
@@ -242,11 +256,24 @@ validate_path() {
     fi
 }
 
+# validate_profile — reject names that could escape the sqmate config namespace.
+validate_profile() {
+    local profile="$1"
+
+    if [[ "$profile" =~ ^[A-Za-z0-9._-]+$ && "$profile" != "." && "$profile" != ".." ]]; then
+        return 0
+    fi
+
+    log_message "ERROR" "Invalid profile name: '$profile' (use letters, numbers, dot, underscore, or hyphen)"
+    return 1
+}
+
 # validate_hostname — reject strings that cannot be valid hostnames or IP addresses.
 validate_hostname() {
     local hostname="$1"
-    if [[ "$hostname" =~ ^[a-zA-Z0-9.-]+$    # hostname / IPv4
-       || "$hostname" =~ ^\[[0-9a-fA-F:]+\]$  # [IPv6]
+    if [[ "$hostname" =~ ^[a-zA-Z0-9.-]+$       # hostname / IPv4
+       || "$hostname" =~ ^[0-9a-fA-F:]+$         # IPv6 literal
+       || "$hostname" =~ ^\[[0-9a-fA-F:]+\]$    # [IPv6]
     ]]; then
         return 0
     fi
@@ -318,7 +345,7 @@ check_port_available() {
     local host="$1" port="$2"
 
     if command -v ss &>/dev/null; then
-        if ss -tuln | grep -qE "(${host}|0\.0\.0\.0|\[::\]):${port}[[:space:]]"; then
+        if ss -H -tuln 2>/dev/null | awk -v port=":$port" '$0 ~ port "[[:space:]]" { found=1 } END { exit found ? 0 : 1 }'; then
             log_message "ERROR" "Port ${host}:${port} is already in use."
             return 1
         fi
@@ -350,7 +377,33 @@ check_required_tools() {
 # STATE PERSISTENCE  (config files + PID files)
 # ==============================================================================
 
-# load_config — source the profile config file if it exists.
+# _config_decode_value — read legacy quoted config values without evaluating code.
+_config_decode_value() {
+    local value="$1"
+
+    value="${value%$'\r'}"
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+        value="${value:1:${#value}-2}"
+        value="${value//\\\"/\"}"
+        value="${value//\\\\/\\}"
+    fi
+
+    printf '%s' "$value"
+}
+
+# _config_write_var — write one newline-free key/value pair.
+_config_write_var() {
+    local key="$1" value="$2"
+
+    if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+        log_message "ERROR" "Refusing to write config value with embedded newline: $key"
+        return 1
+    fi
+
+    printf '%s=%s\n' "$key" "$value"
+}
+
+# load_config — read the profile config file without executing it as shell code.
 load_config() {
     local cfg="${CONFIG_DIR}/config_${PROFILE:-default}"
 
@@ -363,24 +416,38 @@ load_config() {
     if [[ -f "$cfg" ]]; then
         chmod 600 "$cfg" 2>/dev/null || log_message "WARNING" "Cannot set permissions on: $cfg"
 
-        if ! bash -n "$cfg" 2>/dev/null; then
-            log_message "ERROR" "Syntax error in config file: $cfg"
-            return 1
-        fi
+        local line key value
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
 
-        # shellcheck source=/dev/null
-        source "$cfg" || {
-            log_message "ERROR" "Failed to source config file: $cfg"
-            return 1
-        }
+            if [[ "$line" != *=* ]]; then
+                log_message "WARNING" "Ignoring malformed config line in $cfg: $line"
+                continue
+            fi
+
+            key="${line%%=*}"
+            value="$(_config_decode_value "${line#*=}")"
+
+            case "$key" in
+                SQL_HOST)           SQL_HOST="$value" ;;
+                SQL_PORT)           SQL_PORT="$value" ;;
+                SQL_DIR)            SQL_DIR="$value" ;;
+                SQL_ENGINE)         SQL_ENGINE="$value" ;;
+                SUPPORTS_DAEMONIZE) SUPPORTS_DAEMONIZE="$value" ;;
+                SOCKET_FILE)        : ;; # Derived from profile and port; retained only for legacy configs.
+                *)                  log_message "WARNING" "Ignoring unknown config key in $cfg: $key" ;;
+            esac
+        done < "$cfg"
+
+        validate_hostname "$SQL_HOST" || return 1
+        validate_port "$SQL_PORT" || return 1
     else
         log_message "INFO" "No config file found at $cfg — using defaults."
     fi
 
     CONFIG_FILE="$cfg"
 
-    # Re-derive paths now that SQL_PORT (and other vars) may have been loaded
-    # from the config file.
+    # Re-derive paths now that SQL_PORT may have been loaded from the config file.
     _derive_paths
 }
 
@@ -394,20 +461,19 @@ save_config() {
     local abs_sql_dir
     abs_sql_dir=$(realpath -m "$SQL_DIR" 2>/dev/null) || abs_sql_dir="$SQL_DIR"
 
-    if ! cat > "$CONFIG_FILE" <<EOF
-# sqmate configuration — profile: ${PROFILE}
-# Auto-generated by sqmate ${VERSION}. Edit with care.
-SQL_HOST="${SQL_HOST}"
-SQL_PORT="${SQL_PORT}"
-SQL_DIR="${abs_sql_dir}"
-SQL_ENGINE="${SQL_ENGINE}"
-SOCKET_FILE="${SOCKET_FILE}"
-SUPPORTS_DAEMONIZE="${SUPPORTS_DAEMONIZE}"
-EOF
-    then
+    {
+        printf '# sqmate configuration — profile: %s\n' "$PROFILE"
+        printf '# Auto-generated by sqmate %s. Edit with care.\n' "$VERSION"
+        _config_write_var SQL_HOST "$SQL_HOST"
+        _config_write_var SQL_PORT "$SQL_PORT"
+        _config_write_var SQL_DIR "$abs_sql_dir"
+        _config_write_var SQL_ENGINE "$SQL_ENGINE"
+        _config_write_var SOCKET_FILE "$SOCKET_FILE"
+        _config_write_var SUPPORTS_DAEMONIZE "$SUPPORTS_DAEMONIZE"
+    } > "$CONFIG_FILE" || {
         log_message "ERROR" "Failed to write config file: $CONFIG_FILE"
         return 1
-    fi
+    }
 
     chmod 600 "$CONFIG_FILE" || log_message "WARNING" "Cannot set permissions on: $CONFIG_FILE"
 }
@@ -619,14 +685,15 @@ initialize_data_directory() {
         log_message "INFO" "  SET PASSWORD FOR 'root'@'localhost' = PASSWORD('yourpass');"
 
     else
+        local init_error_log="${SQL_DIR}/logs/mysqld_error.log"
         log_message "INFO" "Using mysqld --initialize (MySQL)."
-        "$SQL_BIN" --initialize --datadir="$data_dir" --basedir="$SQL_DIR" || {
+        "$SQL_BIN" --initialize --datadir="$data_dir" --basedir="$SQL_DIR" --log-error="$init_error_log" || {
             log_message "ERROR" "Failed to initialise MySQL data directory."
             return 1
         }
 
         log_message "SUCCESS" "MySQL data directory initialised."
-        log_message "WARNING" "Temporary root password is in: ${SQL_DIR}/logs/mysqld_error.log"
+        log_message "WARNING" "Temporary root password is in: $init_error_log"
         log_message "INFO" "Change it after first login:"
         log_message "INFO" "  ALTER USER 'root'@'localhost' IDENTIFIED BY 'yourpass';"
     fi
@@ -721,9 +788,11 @@ start_server() {
         --bind-address="$SQL_HOST"
         --pid-file="$SERVER_PIDFILE"
         --log-error="$error_log"
-        --general-log
-        --general-log-file="$general_log"
     )
+
+    if [[ "${SQMATE_GENERAL_LOG:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+        base_args+=(--general-log --general-log-file="$general_log")
+    fi
 
     log_message "INFO" "Starting ${SQL_ENGINE^} server on ${SQL_HOST}:${SQL_PORT}"
     log_message "INFO" "  Data dir : $data_dir"
@@ -777,8 +846,8 @@ start_server() {
             lsof -i :"$SQL_PORT" -sTCP:LISTEN -t 2>/dev/null \
                 | grep -q "^${sql_pid}$" && { port_bound=1; break; }
         elif command -v ss &>/dev/null; then
-            ss -tuln \
-                | grep -qE "(${SQL_HOST}|0\.0\.0\.0|\[::\]):${SQL_PORT}[[:space:]]" \
+            ss -H -tuln 2>/dev/null \
+                | awk -v port=":$SQL_PORT" '$0 ~ port "[[:space:]]" { found=1 } END { exit found ? 0 : 1 }' \
                 && { port_bound=1; break; }
         else
             port_bound=1
@@ -812,12 +881,6 @@ stop_server() {
         sql_host="$SQL_HOST"
         sql_port="$SQL_PORT"
         sql_engine="${SQL_ENGINE:-SQL}"
-        local port_pids
-        port_pids=$(find_port_processes "$sql_port")
-        if [[ -n "$port_pids" ]]; then
-            server_pid="$port_pids"
-            found_server=1
-        fi
     fi
 
     if (( found_server == 0 )); then
@@ -828,9 +891,8 @@ stop_server() {
 
     local failed=0
 
-    # server_pid may contain multiple space-separated PIDs when obtained from
-    # find_port_processes (the PID-file-absent fallback path).  All signal
-    # operations iterate over the set individually.
+    # Only stop processes tracked by sqmate. Avoid killing arbitrary services
+    # that happen to be listening on the same port.
     local pid any_alive=0
     for pid in $server_pid; do
         kill -0 "$pid" 2>/dev/null && { any_alive=1; break; }
@@ -887,13 +949,12 @@ stop_server() {
         fi
     fi
 
-    cleanup_pid_files "$PROFILE"
-
     if (( failed == 0 )); then
+        cleanup_pid_files "$PROFILE"
         log_message "SUCCESS" "${sql_engine^} server stopped."
         return 0
     else
-        log_message "ERROR" "Server did not stop cleanly."
+        log_message "ERROR" "Server did not stop cleanly. Tracking files left intact for inspection."
         return 1
     fi
 }
@@ -966,7 +1027,7 @@ restart_server() {
     fi
 
     # stop_server inherently verifies that the port is freed before returning.
-    stop_server
+    stop_server || return 1
 
     start_server || return 1
     log_message "SUCCESS" "SQL server restarted."
@@ -1053,8 +1114,8 @@ DELETE FROM mysql.user
 FLUSH PRIVILEGES;"
     fi
 
-    "$client" -u root --socket="$temp_socket" <<< "$reset_sql"
-    local reset_rc=$?
+    local reset_rc=0
+    "$client" -u root --socket="$temp_socket" <<< "$reset_sql" || reset_rc=$?
 
     log_message "INFO" "Shutting down safe-mode server…"
     kill -TERM "$safe_pid" 2>/dev/null
@@ -1112,6 +1173,7 @@ main() {
     for arg in "$@"; do
         if [[ "$arg" == --profile=* ]]; then
             PROFILE="${arg#*=}"
+            validate_profile "$PROFILE" || return 1
             _derive_paths
             break
         fi

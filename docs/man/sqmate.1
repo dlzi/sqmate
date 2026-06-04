@@ -1,6 +1,6 @@
 .\" Man page for SQMATE
-.\" Generated for SQMATE 1.2.0
-.TH SQMATE 1 "May 23, 2026" "SQMATE 1.2.0" "User Commands"
+.\" Generated for SQMATE 1.2.1
+.TH SQMATE 1 "June 4, 2026" "SQMATE 1.2.1" "User Commands"
 .SH NAME
 sqmate \- Universal SQL Server Manager for MySQL and MariaDB portable installations
 .SH SYNOPSIS
@@ -222,7 +222,7 @@ Database data directory containing system tables and user data.
 Database server error log.
 .TP
 .I SQL_DIR/logs/mysqld_general.log
-Database server general query log.
+Database server general query log, created only when SQMATE_GENERAL_LOG=1 is set.
 .SH EXIT STATUS
 .TP
 0
@@ -237,6 +237,9 @@ Invalid command-line option
 .TP
 .B SQMATE_CONFIG_DIR
 Override default configuration directory (~/.config/sqmate).
+.TP
+.B SQMATE_GENERAL_LOG
+Set to 1, yes, true, or on to enable the database general query log.
 .SH SECURITY CONSIDERATIONS
 .IP \(bu 2
 By default, servers bind to localhost only for security.
