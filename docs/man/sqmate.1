@@ -1,6 +1,6 @@
 .\" Man page for SQMATE
 .\" Generated for SQMATE 1.2.1
-.TH SQMATE 1 "June 4, 2026" "SQMATE 1.2.1" "User Commands"
+.TH SQMATE 1 "July 13, 2026" "SQMATE 1.2.1" "User Commands"
 .SH NAME
 sqmate \- Universal SQL Server Manager for MySQL and MariaDB portable installations
 .SH SYNOPSIS
@@ -17,6 +17,15 @@ sqmate \- Universal SQL Server Manager for MySQL and MariaDB portable installati
 is a lightweight command-line utility that simplifies management of portable MySQL and MariaDB installations for local development. It automatically detects your database engine and streamlines server startup, configuration, and monitoring with sensible defaults and multiple profile support.
 .PP
 SQMATE requires Bash 4.3 or higher and a portable MySQL or MariaDB installation.
+It also requires the
+.BR realpath (1)
+and
+.BR mktemp (1)
+utilities. The
+.BR ss (8)
+and
+.BR lsof (8)
+utilities are optional and improve port and process checks.
 .SH COMMANDS
 .TP
 .B init
@@ -123,7 +132,9 @@ Use specific configuration profile (default: default).
 ]
 .br
 Reset root authentication. Starts the server in skip-grant-tables mode,
-clears the root password, and restores native password authentication.
+with networking disabled, clears the root password, and restores native
+password authentication. The temporary server is cleaned up on success,
+failure, or interruption.
 .RS
 .TP
 .B \-\-profile=NAME
@@ -204,10 +215,16 @@ for initialization with no default root password.
 .SH FILES
 .TP
 .I ~/.config/sqmate/config_PROFILE
-Configuration file for each profile. PROFILE is the profile name (default: default).
+Configuration file for each profile. PROFILE is the profile name (default: default);
+profile names may contain only letters, numbers, dots, underscores, and hyphens.
+.TP
+.I ~/.config/sqmate/sqmate_PROFILE_PORT.server.pid
+The database server's own PID file for the profile and port.
 .TP
 .I ~/.config/sqmate/sqmate_PROFILE.pid
-PID file for the running server for each profile.
+Tracking file for the running server, including its PID, SQL binary, profile,
+port, socket, and data paths. SQMATE validates the tracked process before
+stop or restart actions.
 .TP
 .I ~/.config/sqmate/sqmate_PROFILE.log
 Log file for SQMATE operations for each profile.
@@ -252,7 +269,16 @@ only when external access is needed.
 .IP \(bu 2
 Change default passwords immediately after setup.
 .IP \(bu 2
-Configuration files are protected with 600 permissions.
+The configuration directory is restricted to the current user. Configuration
+and tracking files are written with 600 permissions and replaced atomically.
+.IP \(bu 2
+.B reset-auth
+uses
+.B \-\-skip-grant-tables
+and
+.B \-\-skip-networking
+with a private temporary socket/PID directory. The temporary server and files
+are cleaned up on success, failure, or interruption.
 .SH TROUBLESHOOTING
 .TP
 .B "SQL directory not configured"
@@ -289,10 +315,11 @@ Based on the design patterns of PHMATE by Daniel Zilli
 .BR lsof (8),
 .BR ss (8)
 .PP
-The
+SQMATE uses
 .B ss
-command is preferred for port checking, with
+and
 .B lsof
-used as a fallback.
+when available for port and process checks. These tools are optional; without
+either one, pre-flight port conflict checking is unavailable.
 .SH LICENSE
 MIT License

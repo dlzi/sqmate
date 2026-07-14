@@ -2,15 +2,19 @@
 
 All notable changes to SQmate will be documented in this file.
 
-## [1.2.1] - Unreleased
+## [1.2.1] - 13/07/2026
 
 ### Fixed
 - Fixed positional `host:port` parsing so numeric ports, `:port`, hostnames, and bracketed IPv6 do not corrupt `BASH_REMATCH` under `set -u`.
 - Added strict profile-name validation to prevent profile path traversal.
 - Replaced shell `source` config loading with a strict key-value parser that does not execute config contents.
 - Made `reset-auth` always clean up the safe-mode server when the SQL reset command fails.
+- Made `reset-auth` clean up the safe-mode server and its temporary files when interrupted.
 - Made `restart` abort if `stop` fails.
 - Prevented `stop` from killing unrelated processes that merely listen on the same port.
+- Added PID identity checks so tracking files must match the configured SQL binary and listening port before lifecycle commands act on them.
+- Made config and PID-file updates atomic, mode-restricted, and resistant to malformed newline-containing values.
+- Added `ss` process-aware fallback checks when `lsof` is unavailable.
 - Kept tracking files intact when shutdown fails so the failed server remains inspectable.
 - Disabled general query logging by default; enable it with `SQMATE_GENERAL_LOG=1`.
 - Wrote MySQL initialization errors to the documented error log path.
