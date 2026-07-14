@@ -17,6 +17,7 @@ Sqmate is a lightweight command-line utility that simplifies management of porta
 - **Socket Connection**: Secure local connections via Unix domain sockets
 - **GUI Tool Compatible**: Works with database management tools like Navicat, phpMyAdmin, etc.
 - **Robust Error Handling**: Comprehensive error checking, validation, and detailed logs
+- **Tracked Process Safety**: PID files are checked against the configured SQL binary and listening port before stop/restart actions
 - **Logging**: Detailed operation logs written to `~/.config/sqmate/sqmate_<profile>.log`
 - **Status Monitoring**: View running server status including uptime and process information
 - **Multiple Instances**: Run multiple database servers simultaneously on different ports
@@ -25,7 +26,7 @@ Sqmate is a lightweight command-line utility that simplifies management of porta
 
 - **Bash**: Version 4.3 or higher
 - **MySQL or MariaDB**: Portable installation (any recent version)
-- **Standard Unix Tools**: ps, kill, realpath (required), ss/lsof (optional for port checking)
+- **Standard Unix Tools**: ps, kill, realpath, and mktemp (required); ss/lsof (optional for enhanced port and process checks)
 - **Critical Dependency**: `libcrypt.so.1` library (see Compatibility Notes below)
 
 ## Installation
@@ -288,7 +289,7 @@ All configuration files are stored in `~/.config/sqmate/`:
 | File Type | Location | Description |
 |-----------|----------|-------------|
 | **Profile Config** | `~/.config/sqmate/config_<profile>` | Stores SQL_DIR, host, port, engine type, daemonize support |
-| **Sqmate PID** | `~/.config/sqmate/sqmate_<profile>.pid` | Tracks sqmate's view of server state |
+| **Sqmate PID** | `~/.config/sqmate/sqmate_<profile>.pid` | Tracks the server PID, SQL binary, profile, port, socket, and data paths |
 | **Server PID** | `~/.config/sqmate/sqmate_<profile>_<port>.server.pid` | Actual database server PID |
 | **Sqmate Logs** | `~/.config/sqmate/sqmate_<profile>.log` | Sqmate operation logs |
 | **Socket File** | `/tmp/sqmate_<profile>_<port>.sock` | Unix domain socket for local connections |
@@ -304,6 +305,7 @@ Sqmate uses profiles to manage multiple database configurations:
 - **Persistent Storage**: All settings are saved and restored between sessions
 - **Isolation**: Each profile has separate configuration, logs, and PID files
 - **Multiple Engines**: Run MySQL and MariaDB simultaneously with different profiles
+- **Profile names**: May contain letters, numbers, dots, underscores, and hyphens; path separators are rejected
 
 **Important**: A profile must be initialized with `sqmate init --profile=<n>` before you can start a server with that profile.
 
@@ -370,6 +372,9 @@ sqmate start
 The `reset-auth` command:
 
 - ✅ Safely resets root user authentication
+- ✅ Runs the temporary server with networking disabled
+- ✅ Uses a private temporary directory for its socket and PID file
+- ✅ Cleans up the temporary server and files on success, failure, or interruption
 - ✅ Sets up native password authentication
 - ✅ Removes password requirement (MariaDB)
 - ✅ Fixes GUI tool connectivity issues
@@ -419,10 +424,12 @@ The `reset-auth` command:
 - **Local Binding**: By default, servers bind to localhost only (127.0.0.1)
 - **Socket Connections**: Local connections use secure Unix domain sockets
 - **Network Access**: Use `--host=0.0.0.0` only when needed for external access
+- **Authentication Reset**: `reset-auth` uses `--skip-grant-tables` together with `--skip-networking` and its signal cleanup terminates the temporary server
 - **Password Management**: 
       - MariaDB: No password by default after `reset-auth`
       - MySQL: Check logs for temporary password after `init`
-- **File Permissions**: Configuration files are protected with 600 permissions
+- **File Permissions**: The configuration directory is restricted to the current user; configuration and tracking files are written with 600 permissions and replaced atomically
+- **Process Tracking**: Stop and restart verify the tracked PID against the configured SQL binary and port before sending signals
 - **Multiple Users**: Each user has their own isolated configuration in their home directory
 
 ## License
